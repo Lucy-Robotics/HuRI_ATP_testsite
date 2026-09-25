@@ -42,6 +42,27 @@ _PROBE_TIMEOUT = 2.0
 _PROBE_CACHE_TTL = 1.5
 
 
+async def _app_is_serving(client: httpx.AsyncClient, base_url: str) -> bool:
+    """Is HuRI's Serve app actually deployed and serving at ``base_url``?
+
+    Prefers HuRI's own ``/modules`` route, but that only exists on HuRI
+    branches that carry the web interface — a HuRI started from an older
+    checkout 404s there while its ``/session`` websocket works fine, and
+    treating that as "down" kept the frontend from ever opening its socket.
+    Fall back to Ray Serve's built-in ``/-/routes``, which every version
+    has: it lists ``{route_prefix: app}`` and stays empty until the app
+    finishes deploying, so it keeps the "proxy up but app still loading"
+    case (see :meth:`HuriLauncher._wait_ready`) reported as not ready.
+    """
+    resp = await client.get(f"{base_url}/modules")
+    if resp.is_success:
+        return True
+    if resp.status_code != 404:
+        return False
+    routes = await client.get(f"{base_url}/-/routes")
+    return routes.is_success and bool(routes.json())
+
+
 class AlreadyRunningError(RuntimeError):
     pass
 
@@ -137,8 +158,7 @@ class HuriLauncher:
             return cached[1]
         try:
             async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
-                resp = await client.get(f"{self.probe_url}/modules")
-                up = resp.is_success
+                up = await _app_is_serving(client, self.probe_url)
         except Exception:
             up = False
         self._probe_cache = (time.time(), up)
@@ -296,10 +316,9 @@ class HuriLauncher:
                 if self._status != "starting":
                     return  # already resolved (crashed, or stop requested)
                 try:
-                    resp = await client.get(f"{self.probe_url}/modules")
-                    resp.raise_for_status()
-                    self._status = "running"
-                    return
+                    if await _app_is_serving(client, self.probe_url):
+                        self._status = "running"
+                        return
                 except Exception:
                     pass
                 await asyncio.sleep(_READY_POLL_INTERVAL)

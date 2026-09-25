@@ -100,7 +100,14 @@ export function useWebSocket(initialModules, { enabled = true } = {}) {
           onToken(msg);
           break;
         case "audio":
-          onAudio({ ...msg, data: decodeAudio(msg.data) });
+          // The wire field is snake_case (web_interface.py's WebAudioHook);
+          // without this mapping createBuffer() gets an undefined rate and
+          // throws, so every chunk is silently dropped.
+          onAudio({
+            ...msg,
+            data: decodeAudio(msg.data),
+            sampleRate: msg.sample_rate,
+          });
           break;
         case "segment":
           // Gesture frames, already converted to this frontend's rig format
