@@ -37,30 +37,27 @@ http_options:
 applications:
   - name: huri-app
     route_prefix: /
-    import_path: src.app:app
+    import_path: huri_core.app:app
     runtime_env:
       env_vars:
+        # Modules this server enables (default-deny: unset enables none).
+        # Keep in step with the *Handle deployments below.
+        HURI_MODULES: "vad,stt,tag,emo,eag,qag,rag,tts,mov"
         RAY_COLOR_PREFIX: "1"
 
         # --- Gesture sliding-window defaults (run in the HuRI CPU actor) ---
         HURI_GESTURE_CONTEXT_SEC: "2.0"
         HURI_GESTURE_MIN_CHUNK_SEC: "0.5"
         # Caps the EMAGE process to a fraction of GPU memory so TTS keeps the
-        # rest. "0" disables the cap. Keep roughly in line with GestureGeneration
+        # rest. "0" disables the cap. Keep roughly in line with MOVHandle
         # num_gpus below. (Helm sets this on the nvidia worker's containerEnv.)
         HURI_GESTURE_GPU_MEM_FRACTION: "0.2"
 
-        # --- CosyVoice3 / TTS ---
-        # CosyVoice3 contract: "<instruction><|endofprompt|><transcript-of-voice.wav>".
-        # The reference transcript MUST come AFTER the marker, or the LM treats
-        # it as an instruction and intermittently speaks it (prompt leakage).
-        HURI_VOICE_TRANSCRIPT: "You are a helpful assistant.<|endofprompt|>Instinct creates its own oppressors and bids us rise up against them."
-        # From .Values.models.cosytts.env (mountPath/modelId) — edit for local layout.
-        HURI_MODEL_PATH: /models/cosytts/FunAudioLLM/Fun-CosyVoice3-0.5B-2512
-        # Path to the CosyVoice repo root containing third_party/Matcha-TTS.
-        HURI_COSY_DIR: /app/cosyvoice
-        # From .Values.voiceAssets.env — the reference voice sample.
-        HURI_VOICE_SAMPLE_PATH: /assets/voice.wav
+        # --- TTS: Piper (module tts, deployment TTSHandle) ---
+        # ONNX on CPU, ~30x faster than realtime; huri-module-tts[piper]. The
+        # voice: python -m piper.download_voices --download-dir assets/models/piper en_US-lessac-medium
+        # (CosyVoice3, tts_cosyvoice, needs an NVIDIA GPU: see config/huri.yaml.)
+        HURI_PIPER_VOICE: assets/models/piper/en_US-lessac-medium.onnx
 
         # --- STT (faster-whisper) ---
         # From .Values.models.whisper.env (mountPath/repoId) — edit for local layout.
@@ -84,7 +81,14 @@ applications:
           num_gpus: 0
 
       # STT: shared faster-whisper actor.
-      - name: STT
+      - name: STTHandle
+        num_replicas: 1
+        ray_actor_options:
+          num_cpus: 1
+          num_gpus: 0
+
+      # EMO: shared prosody-emotion actor.
+      - name: EMOHandle
         num_replicas: 1
         ray_actor_options:
           num_cpus: 1
@@ -109,11 +113,11 @@ applications:
       # These fractions must sum to <= the --num-gpus you pass to `ray start`.
       # As written STT(0.5) + TTS(0.8) + Gesture(0.2) = 1.5, so use
       # --num-gpus=2 (e.g. two physical GPUs), or lower the fractions to fit 1.
-      - name: TTS
+      - name: TTSHandle
         ray_actor_options:
           num_cpus: 1
           num_gpus: 0
-      - name: GestureGeneration
+      - name: MOVHandle
         ray_actor_options:
           num_cpus: 1
           num_gpus: 0

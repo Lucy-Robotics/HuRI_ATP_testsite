@@ -1,3 +1,4 @@
 {
-  "tts": { "name": "tts", "args": {} }
+  "tts": { "name": "tts", "args": {} },
+  "mov": { "name": "mov", "args": {} }
 }

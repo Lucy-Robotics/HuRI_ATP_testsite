@@ -1,6 +1,6 @@
 {
-  "mic": {
-    "name": "mic",
+  "vad": {
+    "name": "vad",
     "args": {
       "vad_agressiveness": 2,
       "silence_duration": 1.0,

@@ -1,6 +1,6 @@
 {
-  "mic": {
-    "name": "mic",
+  "vad": {
+    "name": "vad",
     "args": {
       "vad_agressiveness": 2,
       "silence_duration": 1.0,
@@ -22,5 +22,5 @@
     }
   },
   "tts": { "name": "tts", "args": {} },
-  "gesture": { "name": "gesture", "args": {} }
+  "mov": { "name": "mov", "args": {} }
 }

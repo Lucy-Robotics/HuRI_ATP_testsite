@@ -1,35 +1,34 @@
 """
-Backend bridge between the browser frontend and the HuRI / Ray instance.
+Backend bridge between the browser frontend and a HuRI server.
 
-This is now a thin wrapper around HuRI's own client machinery
-(``src.core.client.Client``) via the browser-facing interface defined in
-``HuRI/src/interfaces/web_interface.py``: this file owns everything that is
-specific to *this website* (Authelia/magic-link auth, CORS, serving the built
-SPA, the module-combination presets, and reshaping gesture output for this
-frontend's 3D rig) while ``web_interface.run_browser_session`` owns the actual
-HuRI session protocol (handshake, senders, hooks, wire (de)serialization).
+The HuRI session itself goes through huri-core's client SDK
+(``huri_core.core.client.HuRIClient``, installed with ``huri-core[client]``
+and the curated events of ``huri-events``, see requirements.txt), driven by
+``huri_bridge.py``. This file owns everything that is specific to *this
+website*: Authelia/magic-link auth, CORS, serving the built SPA, the
+module-combination presets, the HuRI launcher, and reshaping gesture output for
+this frontend's 3D rig.
 
-Frontend <-> backend protocol on ``/ws`` (unchanged from before this refactor):
+Frontend <-> backend protocol on ``/ws`` (unchanged by the move to the SDK):
 
   1. the frontend sends one handshake: ``{"modules": {tag: {name, args}}}``
      (see the repo-root ``presets/`` folder, loaded by ``huri_presets.py``,
      for ready-made combinations);
   2. the backend replies ``{"type": "session_config", "config": {...}}``;
-  3. inbound: binary frames are mic PCM (always ``audio.in``); JSON frames are
-     ``{"topic": "question"|"token", "text": ...}`` — the frontend's event
-     dropdown picks which one a given typed message targets ("rag.in" vs
-     "rag.out" in HuRI/ATP.xlsx's terms);
-  4. outbound: ``{"type": "token"|"audio"|"motion"|"question", ...}``, where a
-     ``"motion"`` message's raw pose/expression/translation arrays have
-     already been converted into this frontend's ``{t, rotations,
-     blendshapes, positions}`` frame format by ``pipeline.py``.
+  3. inbound: binary frames are mic PCM (always ``huri.audio.in``); JSON
+     frames are ``{"topic": "question"|"token", "text": ...}`` — the
+     frontend's event dropdown picks which one a given typed message targets
+     ("rag.in" vs "rag.out" in HuRI/ATP.xlsx's terms);
+  4. outbound: ``{"type": "token"|"audio"|"segment"|"question"|"error", ...}``,
+     where a ``"segment"`` message carries HuRI's raw pose/expression/
+     translation arrays already converted into this frontend's ``{t,
+     rotations, blendshapes, positions}`` frame format by ``pipeline.py``.
 """
 
 import logging
 import os
-import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -39,37 +38,18 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
-# HuRI is not an installed package: make its `src` package importable before
-# pulling in the interface. It's vendored as a git submodule at <repo root>/HuRI
-# (see .gitmodules); fall back to the older sibling-checkout convention
-# (../HuRI next to this repo) for anyone still working that way. Override
-# HURI_REPO_PATH to point elsewhere entirely.
-#
-# Prefer whichever checkout actually has web_interface.py, not just whichever
-# has a `src/` dir: HuRI's own `main` branch doesn't have that module yet (as
-# of this writing it's uncommitted work on a sibling checkout), so a plain
-# `src/` dir isn't enough to tell a real checkout from an empty submodule.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_HURI_SUBMODULE_PATH = _REPO_ROOT / "HuRI"
-_HURI_SIBLING_PATH = _REPO_ROOT.parent / "HuRI"
-
-
-def _has_web_interface(path: Path) -> bool:
-    return (path / "src" / "interfaces" / "web_interface.py").is_file()
-
-
-_HURI_REPO_PATH = os.environ.get(
-    "HURI_REPO_PATH",
-    str(_HURI_SUBMODULE_PATH if _has_web_interface(_HURI_SUBMODULE_PATH) else _HURI_SIBLING_PATH),
+from huri_bridge import browser_module_names, run_browser_session
+from huri_launcher import (
+    AlreadyRunningError,
+    HuriLauncher,
+    NotRunningError,
+    UnknownConfigError,
+    resolve_modules_path,
 )
-if _HURI_REPO_PATH not in sys.path:
-    sys.path.insert(0, _HURI_REPO_PATH)
+from huri_presets import PRESETS_DIR, load_presets
+from pipeline import motion_arrays_to_frames
 
-from src.interfaces.web_interface import run_browser_session  # noqa: E402
-
-from huri_launcher import AlreadyRunningError, HuriLauncher, NotRunningError, UnknownConfigError  # noqa: E402
-from huri_presets import PRESETS_DIR, load_presets  # noqa: E402
-from pipeline import motion_arrays_to_frames  # noqa: E402
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -284,17 +264,40 @@ async def presets() -> Dict[str, Any]:
     without a server restart. Read fresh from the repo-root ``presets/``
     folder on every call (see huri_presets.py), so a preset file added,
     edited, or removed there shows up on the next request with no backend
-    restart."""
-    return load_presets()
+    restart. The files use huri-modules' module names (``vad``, ``mov``);
+    they are served in the frontend's (``mic``, ``gesture``)."""
+    return load_presets(browser_names=True)
+
+
+def _huri_ws_url() -> str:
+    return os.environ.get("HURI_URL", "ws://localhost:8000/session")
 
 
 def _huri_http_base() -> str:
     """HuRI's plain HTTP origin, derived from the same HURI_URL the websocket
-    session connects to — both routes live on the one FastAPI app HuRI's
-    server binds (see HuRI/src/core/huri.py)."""
-    huri_ws_url = os.environ.get("HURI_URL", "ws://localhost:8000/session")
-    http_url = huri_ws_url.replace("wss://", "https://").replace("ws://", "http://")
+    session connects to — ``/session`` and ``/modules`` live on the one
+    FastAPI ingress huri-core's server binds."""
+    http_url = _huri_ws_url().replace("wss://", "https://").replace("ws://", "http://")
     return http_url.rsplit("/", 1)[0]  # drop the trailing "/session"
+
+
+async def _fetch_server_modules() -> Dict[str, Any]:
+    """HuRI's ``GET /modules``: ``{"modules": [...], "details": {...},
+    "huri_core": "..."}`` (huri-core >= 0.4; older servers only give
+    ``modules``)."""
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        resp = await client.get(f"{_huri_http_base()}/modules")
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _server_module_names() -> Optional[List[str]]:
+    """The modules the HuRI server enabled, or None when it can't be asked."""
+    try:
+        return list((await _fetch_server_modules()).get("modules") or [])
+    except Exception as e:
+        logger.info("Could not list HuRI's modules: %s", e)
+        return None
 
 
 async def _require_auth(request: Request) -> str:
@@ -308,11 +311,14 @@ async def _require_auth(request: Request) -> str:
     return sub or "anonymous"
 
 
-# Manages a single local `serve run` subprocess for the HuRI submodule (see
-# huri_launcher.py) — covers HuRI/ATP.xlsx F1 ("launch HuRI with different
-# config files, check the dashboard") without a terminal.
+# Manages a single local `serve run` subprocess, run from the huri-modules
+# checkout (the submodule at huri-modules/, see huri_launcher.py) — covers
+# HuRI/ATP.xlsx F1 ("launch HuRI with different config files, check the
+# dashboard") without a terminal.
 _launcher = HuriLauncher(
-    Path(_HURI_REPO_PATH), probe_url=_huri_http_base(), presets_dir=PRESETS_DIR
+    resolve_modules_path(os.environ, _REPO_ROOT),
+    probe_url=_huri_http_base(),
+    presets_dir=PRESETS_DIR,
 )
 
 
@@ -322,8 +328,8 @@ class _LauncherStartRequest(BaseModel):
 
 @app.get("/launcher/huri/configs")
 async def launcher_configs(_sub: str = Depends(_require_auth)) -> Dict[str, Any]:
-    """Server-side HuRI configs (config/huri*.yaml in the submodule) that can
-    be launched — as opposed to the client_*.yaml configs, which are for a
+    """Server-side HuRI configs (huri-modules' config/huri*.yaml, and the
+    presets/F*/huri*.yaml copies) that can be launched — as opposed to the client_*.yaml configs, which are for a
     client connecting to an already-running HuRI, not for launching one."""
     return {"configs": _launcher.list_configs()}
 
@@ -364,26 +370,33 @@ async def launcher_stop(_sub: str = Depends(_require_auth)) -> Dict[str, Any]:
 
 @app.get("/huri-modules")
 async def huri_modules() -> Dict[str, Any]:
-    """Which modules the connected HuRI instance actually has deployed (see
-    HuRI/src/core/huri.py's "/modules" route) — lets the Event Configuration
-    modal disable module combinations that would otherwise only fail once a
-    tester hits Apply (e.g. "tts"/"gesture" on a machine with no GPU, per
-    HuRI's install_local.sh device plan).
+    """Which modules the connected HuRI instance actually has deployed
+    (huri-core's ``GET /modules``) — lets the Event Configuration modal
+    disable module combinations that would otherwise only fail once a tester
+    hits Apply (e.g. "tts"/"gesture" on a machine with no GPU, per
+    huri-modules' install.sh device plan).
+
+    ``modules`` is in the frontend's names (``vad`` -> ``mic``, ``mov`` ->
+    ``gesture``, either TTS engine -> ``tts``); ``server_modules``,
+    ``details`` and ``huri_core`` are HuRI's answer as is.
 
     ``modules: null`` means HuRI couldn't be reached at all (distinct from an
     empty list, which would mean it's up but has nothing registered) — the
     frontend should let everything through rather than lock the UI when it
     can't tell what's actually available.
     """
-    base = _huri_http_base()
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{base}/modules")
-            resp.raise_for_status()
-            return resp.json()
+        info = await _fetch_server_modules()
     except Exception as e:
-        logger.warning("Could not reach HuRI at %s/modules: %s", base, e)
+        logger.warning("Could not reach HuRI at %s/modules: %s", _huri_http_base(), e)
         return {"modules": None, "error": str(e)}
+    server_modules = list(info.get("modules") or [])
+    return {
+        "modules": browser_module_names(server_modules),
+        "server_modules": server_modules,
+        "details": info.get("details", {}),
+        "huri_core": info.get("huri_core"),
+    }
 
 
 def _transform_outbound(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -392,8 +405,8 @@ def _transform_outbound(message: Dict[str, Any]) -> Dict[str, Any]:
 
     This is the one place gesture output is specific to *this* 3D asset
     (SMPL-X pose/FLAME expression arrays -> named-bone quaternions +
-    blendshapes, see pipeline.py) — HuRI's web_interface has no idea any of
-    this rig-specific shaping exists.
+    blendshapes, see pipeline.py) — huri_bridge.py only forwards HuRI's
+    huri.motion events as raw arrays.
     """
     if message.get("type") != "motion":
         return message
@@ -410,8 +423,7 @@ def _transform_outbound(message: Dict[str, Any]) -> Dict[str, Any]:
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     # SessionMiddleware also populates ws.session from the signed cookie, so the
-    # authenticated OIDC `sub` is available before we hand off to HuRI's
-    # browser-facing interface.
+    # authenticated OIDC `sub` is available before we open the HuRI session.
     sub = ws.session.get("sub")
     if REQUIRE_AUTH and not sub:
         await ws.accept()
@@ -427,7 +439,11 @@ async def websocket_endpoint(ws: WebSocket):
 
     try:
         await run_browser_session(
-            ws, user_id=user_id, transform_outbound=_transform_outbound
+            ws,
+            user_id=user_id,
+            huri_url=_huri_ws_url(),
+            server_modules=_server_module_names,
+            transform_outbound=_transform_outbound,
         )
     except WebSocketDisconnect:
         pass

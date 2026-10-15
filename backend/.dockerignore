@@ -7,3 +7,6 @@ __pycache__/
 .huri_user_id
 Dockerfile
 .dockerignore
+tests/
+.pytest_cache/
+requirements-dev.txt

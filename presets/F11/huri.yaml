@@ -37,9 +37,14 @@ http_options:
 applications:
   - name: huri-app
     route_prefix: /
-    import_path: src.app:app
+    import_path: huri_core.app:app
     runtime_env:
       env_vars:
+        # Modules this server enables (default-deny: unset enables none).
+        # Keep in step with the *Handle deployments below. TTS is CosyVoice3
+        # (tts_cosyvoice, deployment CosyVoiceTTSHandle; config/huri_cpu.yaml
+        # runs Piper's `tts` instead).
+        HURI_MODULES: "vad,stt,tag,emo,eag,qag,rag,tts_cosyvoice,mov"
         OLLAMA_BASE_URL: "http://localhost:11434"
         OLLAMA_API_KEY: "ollama"
 
@@ -53,7 +58,7 @@ applications:
         HURI_GESTURE_CONTEXT_SEC: "2.0"
         HURI_GESTURE_MIN_CHUNK_SEC: "0.5"
         # Caps the EMAGE process to a fraction of GPU memory so TTS keeps the
-        # rest. "0" disables the cap. Keep roughly in line with GestureGeneration
+        # rest. "0" disables the cap. Keep roughly in line with MOVHandle
         # num_gpus below. (Helm sets this on the nvidia worker's containerEnv.)
         HURI_GESTURE_GPU_MEM_FRACTION: "0.2"
 
@@ -91,7 +96,14 @@ applications:
           num_gpus: 0
 
       # STT: shared faster-whisper actor.
-      - name: STT
+      - name: STTHandle
+        num_replicas: 1
+        ray_actor_options:
+          num_cpus: 1
+          num_gpus: 0
+
+      # EMO: shared prosody-emotion actor.
+      - name: EMOHandle
         num_replicas: 1
         ray_actor_options:
           num_cpus: 1
@@ -119,11 +131,11 @@ applications:
       # These fractions must sum to <= the --num-gpus you pass to `ray start`.
       # As written STT(0.5) + TTS(0.8) + Gesture(0.2) = 1.5, so use
       # --num-gpus=2 (e.g. two physical GPUs), or lower the fractions to fit 1.
-      - name: TTS
+      - name: CosyVoiceTTSHandle
         ray_actor_options:
           num_cpus: 1
           num_gpus: 0.8
-      - name: GestureGeneration
+      - name: MOVHandle
         ray_actor_options:
           num_cpus: 1
           num_gpus: 0.2

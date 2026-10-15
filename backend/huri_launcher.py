@@ -1,16 +1,24 @@
 """Launches and supervises a HuRI (Ray Serve) process from this website's
-backend, so a tester can pick a config from the HuRI submodule and bring an
-instance up/down without a terminal — covering HuRI/ATP.xlsx F1 ("Configure
-HuRI") and giving F2-F11 something real to point a client at.
+backend, so a tester can pick a server config and bring an instance up/down
+without a terminal — covering HuRI/ATP.xlsx F1 ("Configure HuRI") and giving
+F2-F11 something real to point a client at.
+
+The server comes from huri-modules (https://github.com/Lucy-Robotics/huri-modules),
+vendored as the git submodule ``huri-modules/`` and installed by its own
+``./install.sh`` (venv in ``huri-modules/.venv``, environment in
+``huri-modules/.huri-local/env.sh``). :func:`resolve_modules_path` finds that
+checkout, and :meth:`HuriLauncher.command_for` builds the ``serve run``
+command the same way huri-modules' generated ``.huri-local/start.sh`` does:
+cwd'd into the checkout (the configs' relative ``assets/...`` paths resolve
+there) with ``.huri-local/env.sh`` sourced first when the installer wrote one
+(the venv, the model paths and the LLM API key of ``secrets.env``).
 
 Single-instance by design: HuRI binds fixed local ports (Ray Serve's HTTP
 ingress and the Ray dashboard), so running two at once would just collide.
-``HuriLauncher`` therefore tracks exactly one subprocess, started with
-``serve run <config path>`` (cwd'd into the HuRI checkout, matching the usage
-comment at the top of HuRI/config/huri.yaml) and torn down with SIGINT (the
-same as Ctrl-C, which `serve run` handles as a controlled shutdown) followed
-by ``ray stop`` to reclaim the local Ray head it may have started. The config
-path can point at either a bare ``HuRI/config/huri*.yaml`` or one of its
+``HuriLauncher`` therefore tracks exactly one subprocess, torn down with SIGINT
+(the same as Ctrl-C, which `serve run` handles as a controlled shutdown)
+followed by ``ray stop`` to reclaim the local Ray head it may have started.
+The config can be a bare ``huri-modules/config/huri*.yaml`` or one of its
 per-ATP-feature copies under the website's own ``presets/`` folder (see
 ``presets/README.md`` and :meth:`HuriLauncher._discover_configs`).
 
@@ -26,7 +34,7 @@ import signal
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
@@ -42,14 +50,43 @@ _PROBE_TIMEOUT = 2.0
 _PROBE_CACHE_TTL = 1.5
 
 
+def resolve_modules_path(environ: Mapping[str, str], repo_root: Path) -> Path:
+    """The huri-modules checkout the server is run from: ``HURI_MODULES_PATH``
+    when set, else the ``huri-modules/`` submodule of this repo when it is
+    checked out, else a sibling ``../huri-modules`` checkout (the submodule
+    path again when neither exists, so errors name the expected place)."""
+    explicit = environ.get("HURI_MODULES_PATH")
+    if explicit:
+        return Path(explicit)
+    submodule = repo_root / "huri-modules"
+    sibling = repo_root.parent / "huri-modules"
+    for candidate in (submodule, sibling):
+        if (candidate / "config").is_dir():
+            return candidate
+    return submodule
+
+
+def resolve_bin(
+    environ: Mapping[str, str], variable: str, modules_path: Path, name: str
+) -> str:
+    """A HuRI binary (``serve``, ``ray``): the ``variable`` override, else the
+    one in huri-modules' installer venv, else ``name`` on PATH."""
+    explicit = environ.get(variable)
+    if explicit:
+        return explicit
+    candidate = modules_path / ".venv" / "bin" / name
+    if os.access(candidate, os.X_OK):
+        return str(candidate)
+    return name
+
+
 async def _app_is_serving(client: httpx.AsyncClient, base_url: str) -> bool:
     """Is HuRI's Serve app actually deployed and serving at ``base_url``?
 
-    Prefers HuRI's own ``/modules`` route, but that only exists on HuRI
-    branches that carry the web interface — a HuRI started from an older
-    checkout 404s there while its ``/session`` websocket works fine, and
-    treating that as "down" kept the frontend from ever opening its socket.
-    Fall back to Ray Serve's built-in ``/-/routes``, which every version
+    Prefers HuRI's own ``/modules`` route (huri-core >= 0.4), but a HuRI
+    started from an older checkout may 404 there while its ``/session``
+    websocket works fine, and treating that as "down" kept the frontend from
+    ever opening its socket. Fall back to Ray Serve's built-in ``/-/routes``, which every version
     has: it lists ``{route_prefix: app}`` and stays empty until the app
     finishes deploying, so it keeps the "proxy up but app still loading"
     case (see :meth:`HuriLauncher._wait_ready`) reported as not ready.
@@ -83,9 +120,20 @@ class HuriLauncher:
     uvicorn process (see backend/Dockerfile's CMD).
     """
 
-    def __init__(self, repo_path: Path, probe_url: str, presets_dir: Optional[Path] = None):
-        self.repo_path = repo_path
-        self.config_dir = repo_path / "config"
+    def __init__(
+        self,
+        modules_path: Path,
+        probe_url: str,
+        presets_dir: Optional[Path] = None,
+        environ: Optional[Mapping[str, str]] = None,
+    ):
+        environ = os.environ if environ is None else environ
+        # The huri-modules checkout (see resolve_modules_path): `serve run`
+        # runs from there, and its config/huri*.yaml are launchable.
+        self.modules_path = modules_path
+        self.config_dir = modules_path / "config"
+        # Written by huri-modules' ./install.sh: venv, model paths, API key.
+        self.env_script = modules_path / ".huri-local" / "env.sh"
         # Per-ATP-feature copies of a huri*.yaml config (see presets/README.md)
         # so a tester can pick "F1/huri_cpu.yaml" straight off the sheet
         # instead of cross-referencing which bare config it happens to be.
@@ -93,11 +141,11 @@ class HuriLauncher:
         # Where readiness is probed (HuRI's own HTTP ingress, not the Ray
         # dashboard) — any response at all means the app is up and serving.
         self.probe_url = probe_url
-        self.dashboard_url = os.environ.get(
+        self.dashboard_url = environ.get(
             "HURI_DASHBOARD_URL", "http://127.0.0.1:8265/"
         )
-        self.serve_bin = os.environ.get("HURI_SERVE_BIN", "serve")
-        self.ray_bin = os.environ.get("HURI_RAY_BIN", "ray")
+        self.serve_bin = resolve_bin(environ, "HURI_SERVE_BIN", modules_path, "serve")
+        self.ray_bin = resolve_bin(environ, "HURI_RAY_BIN", modules_path, "ray")
 
         self._process: Optional[asyncio.subprocess.Process] = None
         self._config_name: Optional[str] = None
@@ -116,8 +164,9 @@ class HuriLauncher:
 
     def _discover_configs(self) -> Dict[str, Path]:
         """Every launchable server-side HuRI config, keyed by what the
-        dropdown/API shows: bare ``config/huri*.yaml`` files under the plain
-        name (``"huri.yaml"``), plus any per-ATP-feature copies under
+        dropdown/API shows: huri-modules' bare ``config/huri*.yaml`` files
+        (``huri.yaml``, ``huri_cpu.yaml``, and the installer's
+        ``huri_local.generated.yaml``) under the plain name, plus any per-ATP-feature copies under
         ``presets/`` keyed by their path relative to it (``"F1/huri.yaml"``)
         — see presets/README.md. (``client_*.yaml`` files are the *other*
         kind of config, for a client connecting to an already-running HuRI,
@@ -131,6 +180,22 @@ class HuriLauncher:
                 key = path.relative_to(self.presets_dir).as_posix()
                 configs[key] = path
         return configs
+
+    def command_for(self, config_path: Path) -> List[str]:
+        """The argv launching HuRI with ``config_path``, run with cwd
+        :attr:`modules_path`: ``serve run`` straight, or through bash after
+        sourcing huri-modules' ``.huri-local/env.sh`` when the installer
+        wrote one (as its ``start.sh`` does)."""
+        if self.env_script.is_file():
+            return [
+                "bash",
+                "-c",
+                'source "$0" && exec "$1" run "$2"',
+                str(self.env_script),
+                self.serve_bin,
+                str(config_path),
+            ]
+        return [self.serve_bin, "run", str(config_path)]
 
     def list_configs(self) -> List[str]:
         """Server-side HuRI configs available to launch (see
@@ -227,19 +292,18 @@ class HuriLauncher:
 
             try:
                 self._process = await asyncio.create_subprocess_exec(
-                    self.serve_bin,
-                    "run",
-                    str(config_path),
-                    cwd=str(self.repo_path),
+                    *self.command_for(config_path),
+                    cwd=str(self.modules_path),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                 )
             except FileNotFoundError as exc:
                 self._status = "crashed"
                 self._last_error = (
-                    f"Could not exec {self.serve_bin!r}: {exc}. Is HuRI's Python "
-                    "environment (ray[serve]) active for this backend process? "
-                    "Override with the HURI_SERVE_BIN env var."
+                    f"Could not exec {self.serve_bin!r} in {self.modules_path}: "
+                    f"{exc}. Install the server first (huri-modules/install.sh, "
+                    "see README.md), or point HURI_MODULES_PATH / HURI_SERVE_BIN "
+                    "at an existing install."
                 )
                 raise RuntimeError(self._last_error) from exc
 
@@ -309,7 +373,7 @@ class HuriLauncher:
         # `client.get(self.probe_url)` treated that as ready and declared
         # "running" while the app (still loading STT/RAG/etc. models) would
         # reject every session. Probe a route that only 200s once the app
-        # itself is serving (see HuRI/src/core/huri.py's "/modules").
+        # itself is serving (huri-core's "/modules").
         deadline = time.time() + _READY_TIMEOUT
         async with httpx.AsyncClient(timeout=2.0) as client:
             while time.time() < deadline:
