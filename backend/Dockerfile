@@ -20,10 +20,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# libsndfile backs soundfile/librosa at runtime; git installs huri-core and
-# huri-events from their repositories (requirements.txt).
+# git installs huri-core and huri-events from their repositories
+# (requirements.txt).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libsndfile1 git \
+ && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

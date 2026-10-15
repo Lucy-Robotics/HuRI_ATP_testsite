@@ -3,7 +3,6 @@ uvicorn[standard]
 websockets
 numpy
 scipy
-python-multipart
 authlib
 itsdangerous
 httpx

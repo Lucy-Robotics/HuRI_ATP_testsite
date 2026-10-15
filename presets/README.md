@@ -6,16 +6,14 @@ recursively re-scans this folder (and every subfolder, any depth) on every
 `GET /presets` request (see `backend/huri_presets.py`).
 
 - The preset's key/label is its path relative to this folder, without the
-  `.json` suffix, e.g. `rag_only.json` -> `rag_only`. Presets can be
-  organized into subfolders for convenience — a file at
-  `demo/no_gesture.json` becomes the key `demo/no_gesture`. Nesting is purely
-  organizational; it carries no meaning to the backend or frontend beyond the
-  resulting key.
+  `.json` suffix: `F9/rag_only.json` -> `F9/rag_only`. Nesting is purely
+  organizational.
 - The file content is the `modules` block for that combination: a JSON object
-  mapping each event tag to its module, in exactly the shape of a HuRI session
-  handshake (the `modules:` section of a huri-cli client config) and with
-  huri-modules' module names — `vad`, `stt`, `tag`, `emo`, `eag`, `qag`, `rag`,
-  `tts` (Piper) / `tts_cosyvoice` (CosyVoice3), `mov` (gestures):
+  mapping each tag to its module, in exactly the shape of a HuRI session
+  handshake (the `modules:` section of a huri-cli client config, see
+  huri-modules' `config/client_template.yaml`) and with huri-modules' module
+  names — `vad`, `stt`, `tag`, `emo`, `eag`, `qag`, `rag`, `tts` (Piper) /
+  `tts_cosyvoice` (CosyVoice3), `mov` (gestures):
 
   ```json
   {
@@ -30,69 +28,50 @@ recursively re-scans this folder (and every subfolder, any depth) on every
   a warning by the backend rather than breaking the whole `/presets`
   response.
 
-The frontend still names modules as the HuRI monorepo did (`mic`, `gesture`):
-`GET /presets` serves these files renamed for it, and the backend maps the
-browser's handshake back (see `backend/huri_bridge.py`). Write `tts` for speech:
-the backend sends whichever TTS engine the running server enabled (`tts`, or
-`tts_cosyvoice` when only CosyVoice is there).
+Speech presets name `tts_cosyvoice`, the engine `huri.yaml` serves. Against a
+server that runs Piper instead (`huri_cpu.yaml`, or a generated config on a
+machine without the VRAM for CosyVoice), the frontend sends `tts`, the engine
+that server lists in `GET /modules` (`frontend/src/modules.js`).
 
-See the `F*/` files for real examples, and huri-modules'
-`config/client_template.yaml` for the shape.
+This folder holds client presets only. The HuRI server configs are
+huri-modules' own `config/huri*.yaml`, listed by the HuRI Control Panel
+straight from the `huri-modules/` checkout.
 
-## HuRI server configs (`huri*.yaml`)
+## `F*/` folders: one per ATP feature
 
-A folder can also hold a *copy* of one of huri-modules' `config/huri*.yaml`
-(the `huri-modules/` submodule) — the server-side Ray Serve config `serve run`
-launches HuRI with, as opposed to
-the client `modules` presets above. `backend/huri_launcher.py` scans this
-folder tree for `huri*.yaml` the same way `huri_presets.py` scans it for
-`*.json`, and offers them in the HuRI Control Panel's launch dropdown keyed
-by their path here (e.g. `F1/huri_cpu.yaml`), alongside the bare
-`huri-modules/config/huri*.yaml` files (keyed by plain filename). Same rule as
-the client presets: these are copies for the tester's convenience, not the
-source of truth — change huri-modules' `config/huri.yaml` for a real change,
-then re-copy it into whichever `Fx/` folders reference it (they are copies of
-the pinned submodule's files).
+`F2/` through `F11/` mirror the ATP sheet's feature rows: each holds the
+preset that feature's Prerequisites column points at. F1 and F3 are pure
+HuRI-launch tests with no client, so they have no folder.
 
-They are huri-core 0.4 Serve configs: `import_path: huri_core.app:app`, the
-enabled modules in the `HURI_MODULES` env var of `runtime_env` (default-deny:
-a module not listed there is not served), one deployment per module with a
-shared actor named after its `*Handle` class (`STTHandle`, `EMOHandle`,
-`RAGHandle`, `TTSHandle` / `CosyVoiceTTSHandle`, `MOVHandle`) next to the
-`HuRI` ingress, and `HURI_ACTUATION_MODULES` to opt in a module that can drive
-hardware (no curated module does, so none of these sets it). `huri.yaml` runs
-CosyVoice (`tts_cosyvoice`, NVIDIA GPU), `huri_cpu.yaml` Piper (`tts`, CPU).
+Each feature runs on one of huri-modules' Serve configs, launched from the
+Control Panel:
 
-## `F*/` folders
+| Feature | Client preset | Modules | huri-modules config |
+|---|---|---|---|
+| F1 | — | — | `config/huri.yaml` (GPU, CosyVoice) vs `config/huri_cpu.yaml` (CPU, Piper) |
+| F2 | `F2/full_preset.json`, `F2/rag_only.json` | full pipeline / `rag` | `config/huri.yaml` |
+| F3 | — | — | `config/huri.yaml` (launched in parallel, no client) |
+| F4 | `F4/voice_with_speech.json` | full pipeline | `config/huri.yaml` (several clients on one server) |
+| F5, F6 | `F5/voice_to_question.json`, `F6/voice_to_question.json` | `vad`, `stt`, `tag`, `qag` (no emotion) | `config/huri.yaml` |
+| F7 | `F7/text_to_voice.json` | `tts_cosyvoice` | `config/huri.yaml` |
+| F8 | `F8/text_to_avatar.json` | `tts_cosyvoice`, `mov` | `config/huri.yaml` |
+| F9 | `F9/rag_only.json` | `rag` | `config/huri.yaml` |
+| F10 | `F10/voice_emo_to_question.json` | `vad` ... `qag` with emotion | `config/huri.yaml` |
+| F11 | `F11/voice_to_answer.json` | `vad` ... `rag` | `config/huri.yaml` |
 
-`F1/` through `F11/` mirror the ATP sheet's (ATP.xlsx) feature rows one-to-one — each
-holds a *copy* of whichever preset and/or HuRI config that feature's
-Prerequisites column points at (see the sheet's `presets/Fx/...` paths), so a
-tester can follow the spreadsheet straight to a real file without
-cross-referencing which top-level file it happens to reuse. F1 and F3 hold
-only a `huri*.yaml` (no client `modules` preset — neither feature involves a
-client, they're pure HuRI-launch tests).
+"Full pipeline" is `vad`, `stt`, `tag`, `emo`, `eag`, `qag`, `rag`,
+`tts_cosyvoice`, `mov`: mic through speech and gesture.
 
-These are deliberate duplicates, not the source of truth — if you change a
-module combination that's shared across features (e.g. `voice_with_speech`)
-or a HuRI config (`huri.yaml`, `huri_cpu.yaml`), update every copy listed
-below, or the dropdown/ATP will drift out of sync:
+On a machine where `config/huri.yaml` does not fit (no NVIDIA GPU, not enough
+VRAM, remote LLM/Qdrant endpoints), launch `config/huri_local.generated.yaml`
+instead: the installer's config for that machine. Presets that need a module
+it does not serve are greyed out.
 
-| Folder | Client preset | Modules | HuRI config copy of | Used because |
-|---|---|---|---|---|
-| `F1/` | — | — | `huri.yaml`, `huri_cpu.yaml` | GPU vs CPU deployment settings to compare |
-| `F2/` | `full_preset.json`, `rag_only.json` | full pipeline / `rag` | `huri.yaml` | two configs to compare (Configure modules) |
-| `F3/` | — | — | `huri.yaml` | run-in-parallel check needs no client |
-| `F4/` | `voice_with_speech.json` | full pipeline | `huri.yaml` | same config, launched twice (multi-client) |
-| `F5/`, `F6/` | `voice_to_question.json` | `vad`, `stt`, `tag`, `qag` (no emotion) | `huri.yaml` | needs mic + stt |
-| `F7/` | `text_to_voice.json` | `tts` | `huri.yaml` | typed tokens (rag.out) straight to speech |
-| `F8/` | `text_to_avatar.json` | `tts`, `mov` | `huri.yaml` | typed tokens straight to speech + gesture |
-| `F9/` | `rag_only.json` | `rag` | `huri.yaml` | rag only, no voice needed |
-| `F10/` | `voice_emo_to_question.json` | `vad` ... `qag` with emotion | `huri.yaml` | transcript + linked emotion, no reply |
-| `F11/` | `voice_to_answer.json` | `vad` ... `rag` | `huri.yaml` | emotion/transcription checks with a text answer, no tts/gesture output needed |
-
-"Full pipeline" is `vad`, `stt`, `tag`, `emo`, `eag`, `qag`, `rag`, `tts`, `mov`:
-mic through speech and gesture.
+Some features share a preset: `F2/full_preset.json` and
+`F4/voice_with_speech.json`, `F2/rag_only.json` and `F9/rag_only.json`,
+`F5/` and `F6/voice_to_question.json` are identical copies, so each folder is
+self-contained for a tester following the sheet. Change them together:
+`backend/tests/test_presets.py` fails when they differ.
 
 Naming: each name says what the preset *tests*, not just which modules it
 contains — `rag_only` (text in, text out), `voice_with_speech` (the full

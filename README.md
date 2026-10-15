@@ -1,6 +1,6 @@
 # HuRI ATP test website
 
-A browser-based testing console for [HuRI](https://github.com/Lucy-Robotics/HuRI-landing) — lets
+A browser-based testing console for [HuRI](https://github.com/Lucy-Robotics/huri-core) — lets
 a tester pick any module combination (voice in, RAG, TTS, gesture, emotion...), launch HuRI itself
 with a chosen deployment config, and drive a live session from a chat-style UI instead of a
 terminal. Built to exercise every row of the ATP, the test plan this whole site is designed
@@ -80,15 +80,14 @@ script.
 To run the pieces separately (e.g. while iterating on just one of them):
 
 ```bash
-./scripts/run_backend.sh    # FastAPI on :8001, auto-creates backend/.venv
+./scripts/run_backend.sh    # FastAPI on :8001, auto-creates .venv at the repo root
 ./scripts/run_frontend.sh   # Vite dev server on :5173, auto-runs npm install
 ```
 
-The backend auto-detects the huri-modules checkout (the submodule at `huri-modules/`, falling
-back to a sibling `../huri-modules` checkout) and the HuRI Control Panel runs `serve run` from
-it, with its installer environment (`huri-modules/.huri-local/env.sh`: venv, model paths, LLM
-API key) and its venv's `serve`/`ray` binaries. Override with `HURI_MODULES_PATH` if yours lives
-somewhere else.
+The backend finds the huri-modules checkout (`HURI_MODULES_PATH`, else the submodule at
+`huri-modules/`, else a sibling `../huri-modules` checkout) and the HuRI Control Panel runs
+`bash -c 'source .huri-local/env.sh && exec serve run <config>'` from it: the installer's
+environment (venv, model paths, GPU environment, LLM API key) is the one contract it relies on.
 
 By default `REQUIRE_AUTH=0` (`run_all.sh` sets this) — no Authelia needed, every visitor is
 treated as one open `anonymous` session. See **Auth** below to turn on the real login flow.
@@ -101,15 +100,16 @@ huri-modules checkout) on the machine running the backend, and the **HuRI Contro
 config, watch it come up, tail its logs, jump to the Ray dashboard, and open a pre-configured
 client tab.
 
-The config dropdown lists two kinds of files:
-- the bare `huri-modules/config/huri*.yaml` files (`huri.yaml` with CosyVoice, `huri_cpu.yaml`
-  with Piper, and the installer's `huri_local.generated.yaml` — the one that matches your
-  machine), and
-- per-ATP-feature copies under this repo's own `presets/F*/huri*.yaml` — see `presets/README.md`
-  for which folder copies which config and why.
+The config dropdown lists huri-modules' `config/huri*.yaml`: `huri.yaml` (GPU, CosyVoice),
+`huri_cpu.yaml` (CPU, Piper) and the installer's `huri_local.generated.yaml`, the one fitted to
+your machine. `presets/README.md` says which one each ATP feature uses.
 
 Only one HuRI instance can run at a time (it binds fixed local ports), so Start is disabled while
-one is already up.
+one is already up. Stop sends SIGINT to the `serve run` process group (SIGKILL after a grace
+period), then runs `ray stop` only if `serve run` started the Ray head (none was up before
+Start). When HuRI crashes or never gets ready, the output of `huri-modules/.huri-local/status.sh`
+(Qdrant, LLM, Ray, Serve app) lands in the log tail. The backend also stops a HuRI it started
+when it shuts down itself.
 
 ## Testing a session
 
@@ -117,18 +117,15 @@ Once HuRI is running, the app's default connection uses a minimal `rag`-only han
 comes up immediately. From there:
 
 - **Event Configuration** (gear icon) — pick a named preset or a custom module combination for
-  the session. Modules HuRI hasn't actually deployed (e.g. `gesture` on a machine with no GPU)
-  are greyed out and can't be selected — checked live against `GET /huri-modules`, which
-  proxies huri-core's own `GET /modules` (enabled modules, their topics, the huri-core version).
-  The frontend keeps the HuRI monorepo's module names (`mic`, `gesture`, `tts`); the backend
-  maps them to huri-modules' (`vad`, `mov`, and `tts` or `tts_cosyvoice`, whichever TTS engine
-  the server runs).
+  the session. The module list is the server's own (`GET /huri-modules`, a proxy of huri-core's
+  `GET /modules`), in its names (`vad`, `stt`, ..., `tts` or `tts_cosyvoice`, `mov`); presets
+  needing a module it does not serve (e.g. `mov` on a machine with no GPU) are greyed out.
 - **Composer** — type text or use the mic; the event dropdown picks which topic a typed message
   targets (`rag.in`, i.e. `huri.question`, through the full pipeline, or `rag.out`, i.e.
   `huri.token`, straight at TTS/gesture, bypassing RAG — see the ATP's F7-F9 rows).
 - **Chat panel** — each message can be expanded to show its linked emotion reading and the
   RAG-augmented prompt that was actually sent to the LLM.
-- **Avatar** — only rendered when the active session includes the `gesture` module.
+- **Avatar** — only rendered when the active session includes the `mov` module.
 
 `presets/` holds the module-combination JSON files behind the Event Configuration dropdown,
 organized to mirror the ATP's feature rows one-to-one (`F2/` through `F11/`) — see
@@ -138,7 +135,8 @@ file in, no restart needed).
 ## Tests
 
 The backend tests run against a fake HuRI server (no Ray, no models): whole browser sessions
-through the bridge, the preset files, and the launcher's config resolution.
+through the bridge, the preset files, and the launcher (config discovery, and the process
+lifecycle against fake `serve`/`ray` scripts).
 
 ```bash
 .venv/bin/pip install -r backend/requirements-dev.txt
@@ -164,8 +162,7 @@ rather than fall back to a public default, since it's what makes the session coo
 |---|---|---|
 | `HURI_MODULES_PATH` | submodule at `huri-modules/`, else sibling `../huri-modules` | The huri-modules checkout the Control Panel runs `serve run` from, and where it looks for `config/huri*.yaml` |
 | `HURI_URL` | `ws://localhost:8000/session` | The HuRI server the backend's client SDK connects to (its HTTP origin serves `GET /modules`) |
-| `HURI_SERVE_BIN` / `HURI_RAY_BIN` | `<HURI_MODULES_PATH>/.venv/bin/{serve,ray}` when that venv exists, else plain `serve`/`ray` (PATH) | Binaries the Control Panel uses to launch/stop HuRI |
-| `HURI_PRESETS_DIR` | `<repo root>/presets` | Where `/presets` and the Control Panel's config list are scanned from |
+| `HURI_PRESETS_DIR` | `<repo root>/presets` | Where `/presets` is scanned from |
 | `VITE_BACKEND_URL` | `http://localhost:8001` | Backend origin the frontend talks to (build-time env var) |
 | `REQUIRE_AUTH` | `0` in `run_all.sh`, `1` otherwise | See **Auth** above |
 
@@ -174,11 +171,15 @@ rather than fall back to a public default, since it's what makes the session coo
 - `backend/Dockerfile` isn't wired up for a real deployment yet — it doesn't include the
   repo-root `presets/` folder in its build context (see the `TODO(deploy)` comment at its top).
   Local dev via the scripts above is unaffected.
-- `backend/requirements.txt` installs huri-core and huri-events at their release tags (`0.4.0`,
-  `0.1.0`); the `huri-modules` submodule pins a huri-modules commit of `dev` until the `0.1.0`
-  tag exists, and must then be moved to it (`git -C huri-modules checkout 0.1.0`, commit the
-  gitlink).
+- `backend/requirements.txt` pins huri-core (`huri-core[client]`, tag `0.4.0`) and huri-events
+  (huri-modules tag `0.1.0`). Those tags come with the huri-core 0.4.0 / huri-modules 0.1.0
+  release, now in progress: until they are pushed, `pip install -r backend/requirements.txt`
+  fails to resolve them; install both editable from local checkouts instead
+  (`.venv/bin/pip install -e '<huri-core>[client]' -e <huri-modules>/packages/huri-events`,
+  then the rest of the file). The `huri-modules` submodule likewise pins a `dev` commit until
+  the `0.1.0` tag exists, and must then be moved to it (`git -C huri-modules checkout 0.1.0`,
+  commit the gitlink).
 - The Control Panel runs `serve run` with huri-modules' `.huri-local/env.sh`, not the full
-  `.huri-local/start.sh`: it starts Qdrant/Ollama only when huri-modules provides a
-  `.huri-local/services.sh` (otherwise it probes them and warns in the panel), and the Ray head
-  `serve run` autostarts is sized to the whole machine. See FULL_INSTALLATION.md §6.5.
+  `.huri-local/start.sh`: it does not start Qdrant/Ollama (run `start.sh` once, then `stop.sh`
+  without `--all`, to leave them up), and the Ray head `serve run` autostarts is sized to the
+  whole machine. See FULL_INSTALLATION.md §6.5.
