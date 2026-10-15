@@ -31,7 +31,11 @@ recursively re-scans this folder (and every subfolder, any depth) on every
 Speech presets name `tts_cosyvoice`, the engine `huri.yaml` serves. Against a
 server that runs Piper instead (`huri_cpu.yaml`, or a generated config on a
 machine without the VRAM for CosyVoice), the frontend sends `tts`, the engine
-that server lists in `GET /modules` (`frontend/src/modules.js`).
+that server lists in `GET /modules` (`frontend/src/modules.js`'s
+`withServedTTS`). This is a deliberate exception to sending the presets'
+module names as written: a speech preset is therefore never greyed out on a
+Piper-only server, and runs there with Piper. F7 and F8 test CosyVoice: run
+them with `huri.yaml` started from the Control Panel.
 
 This folder holds client presets only. The HuRI server configs are
 huri-modules' own `config/huri*.yaml`, listed by the HuRI Control Panel
@@ -44,7 +48,9 @@ preset that feature's Prerequisites column points at. F1 and F3 are pure
 HuRI-launch tests with no client, so they have no folder.
 
 Each feature runs on one of huri-modules' Serve configs, launched from the
-Control Panel:
+Control Panel (`huri.yaml` and `huri_cpu.yaml` need huri-modules `0.1.0`'s
+runtime fixes: with the submodule's current pin, use the installer's
+`huri_local.generated.yaml` instead, see FULL_INSTALLATION.md §6.5):
 
 | Feature | Client preset | Modules | huri-modules config |
 |---|---|---|---|
