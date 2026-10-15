@@ -27,8 +27,9 @@ Frontend <-> backend protocol on ``/ws`` (unchanged by the move to the SDK):
 
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -291,13 +292,31 @@ async def _fetch_server_modules() -> Dict[str, Any]:
         return resp.json()
 
 
+# HuRI origin -> (fetched_at, module names): the last good GET /modules answer.
+_MODULE_NAMES_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+# Sessions opened within this window reuse the last answer without asking.
+_MODULE_NAMES_TTL = 5.0
+
+
 async def _server_module_names() -> Optional[List[str]]:
-    """The modules the HuRI server enabled, or None when it can't be asked."""
+    """The modules the HuRI server enabled (it picks the TTS engine the
+    browser's ``tts`` means), or None when it was never reachable.
+
+    Asked at most every few seconds rather than on every connect, and a
+    failed ask reuses the last good answer: one slow ``/modules`` must not
+    leave ``tts`` unmapped against a CosyVoice-only server. (The bridge also
+    retries a refused session once with the server's own module list.)"""
+    base = _huri_http_base()
+    cached = _MODULE_NAMES_CACHE.get(base)
+    if cached is not None and time.monotonic() - cached[0] < _MODULE_NAMES_TTL:
+        return list(cached[1])
     try:
-        return list((await _fetch_server_modules()).get("modules") or [])
+        names = list((await _fetch_server_modules()).get("modules") or [])
     except Exception as e:
         logger.info("Could not list HuRI's modules: %s", e)
-        return None
+        return list(cached[1]) if cached is not None else None
+    _MODULE_NAMES_CACHE[base] = (time.monotonic(), names)
+    return names
 
 
 async def _require_auth(request: Request) -> str:
@@ -329,8 +348,9 @@ class _LauncherStartRequest(BaseModel):
 @app.get("/launcher/huri/configs")
 async def launcher_configs(_sub: str = Depends(_require_auth)) -> Dict[str, Any]:
     """Server-side HuRI configs (huri-modules' config/huri*.yaml, and the
-    presets/F*/huri*.yaml copies) that can be launched — as opposed to the client_*.yaml configs, which are for a
-    client connecting to an already-running HuRI, not for launching one."""
+    presets/F*/huri*.yaml copies) that can be launched — as opposed to the
+    client_*.yaml configs, which are for a client connecting to an
+    already-running HuRI, not for launching one."""
     return {"configs": _launcher.list_configs()}
 
 

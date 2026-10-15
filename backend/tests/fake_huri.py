@@ -11,7 +11,21 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from huri_core.core.client import decode, encode
 
-# What each curated module emits, for the subscription check.
+# What each curated module consumes and emits (the input/output topics of
+# huri-modules' huri_module.toml manifests; test_presets.py checks them against
+# the submodule), for huri-core's session wiring check (compat.check_session).
+INPUTS = {
+    "vad": "huri.audio.in",
+    "stt": "huri.voice",
+    "tag": "huri.transcript",
+    "emo": "huri.voice",
+    "eag": "huri.emotion",
+    "qag": "huri.partial_question",
+    "rag": "huri.question",
+    "tts": "huri.token",
+    "tts_cosyvoice": "huri.token",
+    "mov": "huri.audio.out",
+}
 OUTPUTS = {
     "vad": "huri.voice",
     "stt": "huri.transcript",
@@ -50,6 +64,23 @@ class FakeHuri:
     def ws_url(self) -> str:
         return f"ws://127.0.0.1:{self.port}/session"
 
+    def check_session(self, handshake: Dict[str, Any]) -> Optional[str]:
+        """Why the real server would refuse this handshake, or None: an
+        unknown module name, then huri-core's check_session — a module whose
+        input nothing in the session produces or sends, a subscription to a
+        topic no module emits."""
+        names = [m.get("name") for m in handshake["modules"].values()]
+        unknown = [n for n in names if n not in self.modules]
+        if unknown:
+            return f"unknown module(s) {unknown}"
+        produced = {OUTPUTS[n] for n in names}
+        sent = set(handshake.get("send") or [])
+        starved = [n for n in names if INPUTS[n] not in produced | sent]
+        unsubscribable = [t for t in handshake["subscribe"] if t not in produced]
+        if starved or unsubscribable:
+            return f"no producer for {starved} / unsubscribable {unsubscribable}"
+        return None
+
     def _build_app(self) -> FastAPI:
         app = FastAPI()
 
@@ -69,15 +100,12 @@ class FakeHuri:
             await ws.accept()
             handshake = await ws.receive_json()
             self.handshakes.append(handshake)
-            names = [m.get("name") for m in handshake["modules"].values()]
-            unknown = [n for n in names if n not in self.modules]
-            produced = {OUTPUTS[n] for n in names if n in OUTPUTS}
-            unsubscribable = [t for t in handshake["subscribe"] if t not in produced]
-            if unknown or unsubscribable:
+            error = self.check_session(handshake)
+            if error:
                 await ws.send_json(
                     {
                         "type": "session_error",
-                        "error": f"unknown {unknown} / unsubscribable {unsubscribable}",
+                        "error": error,
                         "server_modules": self.modules,
                     }
                 )

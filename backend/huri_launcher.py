@@ -7,11 +7,31 @@ The server comes from huri-modules (https://github.com/Lucy-Robotics/huri-module
 vendored as the git submodule ``huri-modules/`` and installed by its own
 ``./install.sh`` (venv in ``huri-modules/.venv``, environment in
 ``huri-modules/.huri-local/env.sh``). :func:`resolve_modules_path` finds that
-checkout, and :meth:`HuriLauncher.command_for` builds the ``serve run``
-command the same way huri-modules' generated ``.huri-local/start.sh`` does:
-cwd'd into the checkout (the configs' relative ``assets/...`` paths resolve
-there) with ``.huri-local/env.sh`` sourced first when the installer wrote one
-(the venv, the model paths and the LLM API key of ``secrets.env``).
+checkout, and :meth:`HuriLauncher.command_for` builds a *supervised*
+``serve run <config>`` command: cwd'd into the checkout (the configs' relative
+``assets/...`` paths resolve there), with ``.huri-local/env.sh`` sourced first
+when the installer wrote one (the venv, the model paths and the LLM API key of
+``secrets.env``).
+
+That is less than huri-modules' generated ``.huri-local/start.sh`` does, and on
+purpose: ``start.sh`` ends in ``serve deploy``, which detaches and returns, so
+running it would lose the subprocess this launcher tails and stops. What the
+panel does and does not do compared with ``start.sh``:
+
+* Qdrant and Ollama: started only when huri-modules ships them as a separate
+  ``.huri-local/services.sh``, which is run before ``serve run``. Without that
+  file they are the operator's job; the launcher then probes Qdrant's
+  ``/readyz`` and Ollama's ``/api/tags`` (the URLs of the config's
+  ``RAGHandle`` user_config, else the installer's ``plan.env``, else the
+  localhost defaults) and reports a dead one in the log tail and
+  ``last_error`` — RAG otherwise "silently returns nothing".
+* The GPU pin: ``HIP_VISIBLE_DEVICES`` is applied when ``env.sh`` exports it,
+  or, for an older ``env.sh`` that does not, when ``start.sh`` does
+  (:meth:`HuriLauncher.gpu_pin`).
+* Ray sizing: not reproduced. ``serve run`` autostarts a local Ray head sized
+  to the whole machine (every CPU and GPU), not to the installer's
+  ``--num-gpus=$P_RAY_GPUS``. Start a head by hand (``ray start --head
+  --num-gpus=N``) before **Start** to size it; ``serve run`` then joins it.
 
 Single-instance by design: HuRI binds fixed local ports (Ray Serve's HTTP
 ingress and the Ray dashboard), so running two at once would just collide.
@@ -30,6 +50,8 @@ route that touches it must sit behind auth (see main.py's ``_require_auth``)
 import asyncio
 import logging
 import os
+import re
+import shlex
 import signal
 import time
 from collections import deque
@@ -37,6 +59,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 import httpx
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +71,14 @@ _PROBE_TIMEOUT = 2.0
 # Shorter than the frontend's 2s status poll, so every poll sees a fresh-enough
 # answer while N open tabs still collapse into ~one request at HuRI.
 _PROBE_CACHE_TTL = 1.5
+_SERVICE_PROBE_TIMEOUT = 2.0
+# RAGHandle's own defaults (huri_rag.rag.RAGConfig), used when neither the
+# config nor the installer's plan.env names the endpoints.
+_DEFAULT_QDRANT_URL = "http://localhost:6333"
+_DEFAULT_LLM_URL = "http://localhost:11434"
+# Exports of a generated start.sh that the GPU pin consists of.
+_GPU_PIN_VARS = ("HIP_VISIBLE_DEVICES",)
+_EXPORT_RE = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(\S*)\s*$")
 
 
 def resolve_modules_path(environ: Mapping[str, str], repo_root: Path) -> Path:
@@ -78,6 +109,105 @@ def resolve_bin(
     if os.access(candidate, os.X_OK):
         return str(candidate)
     return name
+
+
+def _read_env_file(path: Path) -> Dict[str, str]:
+    """``KEY=value`` lines of a generated ``.env`` file (plan.env, huri.env);
+    empty when it is missing or unreadable."""
+    values: Dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return values
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        try:
+            parts = shlex.split(value)
+        except ValueError:
+            continue
+        values[key.strip()] = parts[0] if parts else ""
+    return values
+
+
+def _read_exports(path: Path) -> Dict[str, str]:
+    """``export NAME=value`` lines of a shell script (no expansion)."""
+    exports: Dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return exports
+    for line in text.splitlines():
+        match = _EXPORT_RE.match(line)
+        if match:
+            exports[match.group(1)] = match.group(2).strip("\"'")
+    return exports
+
+
+def rag_endpoints(config_path: Path, plan: Mapping[str, str]) -> Optional[Dict[str, Any]]:
+    """The external services a Serve config's RAG talks to:
+    ``{"qdrant_url", "llm_url", "ollama"}``, or None when the config serves
+    no RAG (no ``RAGHandle`` deployment) or cannot be read.
+
+    URLs come from the ``RAGHandle`` user_config, else the installer's
+    ``plan.env`` (``HURI_QDRANT_URL``, ``HURI_LLM_URL``), else RAGHandle's
+    defaults. ``ollama`` says whether the LLM is an Ollama the operator has
+    to run (provider ``ollama``, or no provider and Ollama's port).
+    """
+    try:
+        config = yaml.safe_load(config_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    rag = None
+    for app in config.get("applications") or []:
+        for deployment in (app or {}).get("deployments") or []:
+            if (deployment or {}).get("name") == "RAGHandle":
+                rag = deployment
+    if rag is None:
+        return None
+    user_config = rag.get("user_config") or {}
+    qdrant_url = (
+        user_config.get("qdrant_url") or plan.get("HURI_QDRANT_URL") or _DEFAULT_QDRANT_URL
+    )
+    llm_url = user_config.get("llm_url") or plan.get("HURI_LLM_URL") or _DEFAULT_LLM_URL
+    provider = user_config.get("llm_provider") or plan.get("HURI_LLM_PROVIDER")
+    ollama = provider == "ollama" if provider else ":11434" in str(llm_url)
+    return {
+        "qdrant_url": str(qdrant_url).rstrip("/"),
+        "llm_url": str(llm_url).rstrip("/"),
+        "ollama": ollama,
+    }
+
+
+async def _answers(client: httpx.AsyncClient, url: str) -> bool:
+    try:
+        return (await client.get(url)).is_success
+    except Exception:
+        return False
+
+
+async def probe_services(endpoints: Mapping[str, Any]) -> List[str]:
+    """Warnings for the services of :func:`rag_endpoints` that do not answer
+    (Qdrant's ``/readyz``, Ollama's ``/api/tags``); empty when all do."""
+    warnings: List[str] = []
+    async with httpx.AsyncClient(timeout=_SERVICE_PROBE_TIMEOUT, verify=False) as client:
+        qdrant = endpoints["qdrant_url"]
+        if not await _answers(client, f"{qdrant}/readyz"):
+            warnings.append(
+                f"Qdrant is not answering at {qdrant}: RAG retrieval and memory "
+                "will silently return nothing. This panel does not start it; run "
+                "huri-modules/.huri-local/start.sh once, or start Qdrant yourself."
+            )
+        if endpoints["ollama"]:
+            llm = endpoints["llm_url"]
+            if not await _answers(client, f"{llm}/api/tags"):
+                warnings.append(
+                    f"Ollama is not answering at {llm}: RAG cannot generate "
+                    "answers. This panel does not start it; run `ollama serve`."
+                )
+    return warnings
 
 
 async def _app_is_serving(client: httpx.AsyncClient, base_url: str) -> bool:
@@ -134,6 +264,13 @@ class HuriLauncher:
         self.config_dir = modules_path / "config"
         # Written by huri-modules' ./install.sh: venv, model paths, API key.
         self.env_script = modules_path / ".huri-local" / "env.sh"
+        # Qdrant/Ollama bring-up split out of start.sh by newer installers;
+        # run before `serve run` when present (see the module docstring).
+        self.services_script = modules_path / ".huri-local" / "services.sh"
+        # Read for its GPU pin only: it ends in `serve deploy`, which detaches.
+        self.start_script = modules_path / ".huri-local" / "start.sh"
+        # The installer's plan: endpoint URLs when a config does not name them.
+        self.plan_file = modules_path / ".huri-local" / "plan.env"
         # Per-ATP-feature copies of a huri*.yaml config (see presets/README.md)
         # so a tester can pick "F1/huri_cpu.yaml" straight off the sheet
         # instead of cross-referencing which bare config it happens to be.
@@ -153,6 +290,8 @@ class HuriLauncher:
         self._started_at: Optional[float] = None
         self._exit_code: Optional[int] = None
         self._last_error: Optional[str] = None
+        # Pre-launch service warnings (see probe_services), kept in last_error.
+        self._preflight: Optional[str] = None
         self._log_lines: Deque[Tuple[float, str]] = deque(maxlen=_LOG_MAXLEN)
         self._log_task: Optional[asyncio.Task] = None
         self._reap_task: Optional[asyncio.Task] = None
@@ -185,8 +324,20 @@ class HuriLauncher:
         """The argv launching HuRI with ``config_path``, run with cwd
         :attr:`modules_path`: ``serve run`` straight, or through bash after
         sourcing huri-modules' ``.huri-local/env.sh`` when the installer
-        wrote one (as its ``start.sh`` does)."""
+        wrote one, and running its ``.huri-local/services.sh`` (Qdrant,
+        Ollama) when it has one. ``serve run`` stays the process this
+        launcher supervises (``exec``)."""
         if self.env_script.is_file():
+            if self.services_script.is_file():
+                return [
+                    "bash",
+                    "-c",
+                    'source "$0" && bash "$3" && exec "$1" run "$2"',
+                    str(self.env_script),
+                    self.serve_bin,
+                    str(config_path),
+                    str(self.services_script),
+                ]
             return [
                 "bash",
                 "-c",
@@ -196,6 +347,33 @@ class HuriLauncher:
                 str(config_path),
             ]
         return [self.serve_bin, "run", str(config_path)]
+
+    def gpu_pin(self) -> Dict[str, str]:
+        """The GPU pin a generated ``start.sh`` exports
+        (``HIP_VISIBLE_DEVICES``) but ``env.sh`` does not — older installers
+        wrote it into start.sh only — to set in the launched process's
+        environment. Empty when there is none to add."""
+        pinned = _read_exports(self.start_script)
+        in_env = _read_exports(self.env_script)
+        return {
+            name: pinned[name]
+            for name in _GPU_PIN_VARS
+            if name in pinned and name not in in_env
+        }
+
+    async def preflight(self, config_path: Path) -> List[str]:
+        """Warnings about the external services ``config_path``'s RAG needs,
+        when no ``services.sh`` will start them (see :func:`probe_services`)."""
+        if self.services_script.is_file():
+            return []
+        endpoints = rag_endpoints(config_path, _read_env_file(self.plan_file))
+        if endpoints is None:
+            return []
+        return await probe_services(endpoints)
+
+    def _set_error(self, message: str) -> None:
+        """``last_error``, keeping any pre-launch service warning after it."""
+        self._last_error = f"{message} {self._preflight}" if self._preflight else message
 
     def list_configs(self) -> List[str]:
         """Server-side HuRI configs available to launch (see
@@ -286,6 +464,21 @@ class HuriLauncher:
             self._log_lines.clear()
             self._exit_code = None
             self._last_error = None
+            self._preflight = None
+            warnings = await self.preflight(config_path)
+            for warning in warnings:
+                self._log_lines.append((time.time(), f"[launcher] WARNING: {warning}"))
+                logger.warning(warning)
+            if warnings:
+                self._preflight = " ".join(warnings)
+                self._last_error = self._preflight
+            env = None
+            pin = self.gpu_pin()
+            if pin:
+                env = {**os.environ, **pin}
+                self._log_lines.append(
+                    (time.time(), f"[launcher] GPU pin from start.sh: {pin}")
+                )
             self._config_name = config_name
             self._status = "starting"
             self._started_at = time.time()
@@ -294,12 +487,13 @@ class HuriLauncher:
                 self._process = await asyncio.create_subprocess_exec(
                     *self.command_for(config_path),
                     cwd=str(self.modules_path),
+                    env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                 )
             except FileNotFoundError as exc:
                 self._status = "crashed"
-                self._last_error = (
+                self._set_error(
                     f"Could not exec {self.serve_bin!r} in {self.modules_path}: "
                     f"{exc}. Install the server first (huri-modules/install.sh, "
                     "see README.md), or point HURI_MODULES_PATH / HURI_SERVE_BIN "
@@ -387,11 +581,12 @@ class HuriLauncher:
                     pass
                 await asyncio.sleep(_READY_POLL_INTERVAL)
         if self._status == "starting":
-            self._last_error = (
+            message = (
                 f"HuRI did not answer at {self.probe_url} within {_READY_TIMEOUT:.0f}s "
                 "(still starting, or misconfigured — check logs)."
             )
-            logger.warning(self._last_error)
+            self._set_error(message)
+            logger.warning(message)
 
     async def _reap(self) -> None:
         assert self._process is not None
@@ -401,6 +596,6 @@ class HuriLauncher:
             self._status = "stopped"
         else:
             self._status = "crashed"
-            if not self._last_error:
-                self._last_error = f"HuRI exited unexpectedly (code {returncode}); see logs."
+            if not self._last_error or self._last_error == self._preflight:
+                self._set_error(f"HuRI exited unexpectedly (code {returncode}); see logs.")
             logger.warning("HuRI process exited unexpectedly (code %s)", returncode)

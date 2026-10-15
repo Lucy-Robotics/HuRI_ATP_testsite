@@ -1,6 +1,7 @@
 """The browser <-> HuRI bridge: name mapping, handshake, and whole sessions
 through main.app against a fake HuRI server (fake_huri.py)."""
 
+import asyncio
 import base64
 import json
 
@@ -9,7 +10,9 @@ import pytest
 from fastapi.testclient import TestClient
 from huri_events import Audio, Emotion, Motion, RAGQuestion, Token, Transcript
 
+import huri_bridge
 import main
+from fake_huri import OUTPUTS
 from huri_bridge import (
     InvalidHandshake,
     browser_module_names,
@@ -19,6 +22,7 @@ from huri_bridge import (
     to_browser_name,
     to_server_name,
 )
+from huri_presets import load_presets
 
 # --- names ----------------------------------------------------------------------
 
@@ -241,6 +245,81 @@ def test_voice_session_with_speech_and_avatar(huri_env):
     assert segment["frames"][1]["t"] == pytest.approx(0.5 + 1 / 30)
     assert segment["frames"][0]["positions"] == {"pelvis": [1.0, 1.0, 1.0]}
     assert set(segment["frames"][0]["rotations"]) >= {"pelvis", "jaw", "right_thumb3"}
+
+
+PRESETS = load_presets(main.PRESETS_DIR)
+COSYVOICE_ONLY = sorted(set(OUTPUTS) - {"tts"})
+
+
+@pytest.mark.parametrize("server", [sorted(OUTPUTS), COSYVOICE_ONLY], ids=["all", "cosyvoice"])
+@pytest.mark.parametrize("key", sorted(PRESETS))
+def test_every_client_preset_opens_a_session(huri_env, key, server):
+    """Each presets/F*/*.json handshake passes the fake's copy of huri-core's
+    session wiring check, so the bridge sends and subscribes what it needs."""
+    huri_env.modules = server
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"modules": PRESETS[key]})
+            reply = ws.receive_json()
+    assert reply["type"] == "session_config", reply
+
+
+def test_a_session_missing_its_input_is_refused(huri_env, monkeypatch):
+    """Text-to-voice (F7) needs the bridge to send huri.token: without it TTS
+    has no producer and the server refuses the session."""
+    monkeypatch.setattr(huri_bridge, "SENDS", ["huri.audio.in", "huri.question"])
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"modules": PRESETS["F7/text_to_voice"]})
+            reply = ws.receive_json()
+    assert reply["type"] == "error"
+    assert "no producer for ['tts']" in reply["message"]
+
+
+def test_tts_is_remapped_when_the_module_list_is_unknown(huri_env, monkeypatch):
+    """GET /modules failed: the browser's "tts" reaches a CosyVoice-only
+    server unmapped, is refused, and the bridge retries with the server's
+    module list."""
+    huri_env.modules = COSYVOICE_ONLY
+
+    async def unknown():
+        return None
+
+    monkeypatch.setattr(main, "_server_module_names", unknown)
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"modules": {"tts": {"name": "tts", "args": {}}}})
+            reply = ws.receive_json()
+    assert reply["type"] == "session_config"
+    assert reply["config"]["huri_modules"]["tts"]["name"] == "tts_cosyvoice"
+    assert [h["modules"]["tts"]["name"] for h in huri_env.handshakes] == [
+        "tts",
+        "tts_cosyvoice",
+    ]
+
+
+def test_module_list_is_cached_and_survives_a_failed_fetch(huri_env, monkeypatch):
+    calls = []
+
+    async def fetch():
+        calls.append(1)
+        if len(calls) > 1:
+            raise OSError("HuRI is slow")
+        return {"modules": ["rag", "tts_cosyvoice"]}
+
+    monkeypatch.setattr(main, "_fetch_server_modules", fetch)
+    monkeypatch.setattr(main, "_MODULE_NAMES_CACHE", {})
+
+    async def scenario():
+        first = await main._server_module_names()
+        cached = await main._server_module_names()  # within the TTL: no fetch
+        monkeypatch.setattr(main, "_MODULE_NAMES_TTL", 0.0)
+        after_failure = await main._server_module_names()
+        return first, cached, after_failure
+
+    first, cached, after_failure = asyncio.run(scenario())
+    assert first == cached == after_failure == ["rag", "tts_cosyvoice"]
+    assert len(calls) == 2
 
 
 def test_refused_session_reaches_the_browser(huri_env):

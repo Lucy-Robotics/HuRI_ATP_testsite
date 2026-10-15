@@ -1,15 +1,18 @@
 """The presets/ tree: client presets name curated modules, and every server
 config is one huri-core can serve."""
 
+import tomllib
 from pathlib import Path
 
 import pytest
 import yaml
 
-from fake_huri import OUTPUTS
+from fake_huri import INPUTS, OUTPUTS
 from huri_presets import load_presets
 
-PRESETS = Path(__file__).resolve().parents[2] / "presets"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PRESETS = REPO_ROOT / "presets"
+MANIFESTS = sorted((REPO_ROOT / "huri-modules" / "packages").glob("*/*/**/huri_module.toml"))
 SERVER_CONFIGS = sorted(PRESETS.rglob("huri*.yaml"))
 
 # Deployment name of each module's Serve deployment (huri-modules' *Handle
@@ -64,3 +67,16 @@ def test_server_configs_run_huri_core(path):
     expected = {"HuRI"} | {HANDLE_BY_MODULE[m] for m in enabled if m in HANDLE_BY_MODULE}
     assert deployments == expected
 
+
+
+@pytest.mark.skipif(not MANIFESTS, reason="huri-modules submodule not checked out")
+def test_fake_server_wiring_matches_the_manifests():
+    """fake_huri's INPUTS/OUTPUTS are the curated modules' manifest topics."""
+    inputs, outputs = {}, {}
+    for path in MANIFESTS:
+        manifest = tomllib.loads(path.read_text())
+        name = manifest.get("name") or path.parent.name
+        inputs[name] = manifest["input"]["topic"]
+        outputs[name] = (manifest.get("output") or {}).get("topic")
+    assert inputs == INPUTS
+    assert outputs == OUTPUTS

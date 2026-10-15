@@ -153,7 +153,7 @@ Three modes, picked by what's set in the backend's environment (see `backend/mai
 |---|---|---|
 | Open (local dev) | `REQUIRE_AUTH=0` | No login screen; every session is `user_id=anonymous`. |
 | Authelia (OIDC) | `REQUIRE_AUTH=1`, `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `SESSION_SECRET` | Real login via `/auth/login`; the OIDC `sub` becomes the HuRI `user_id` (scopes RAG memory per user). |
-| Magic link (demo) | `MAGIC_LINK_SECRET` | A signed token redeemed at `/auth/magic` drops the same session an OIDC login would, without running Authelia. The minting tool `main.py` refers to (`tools/make_magic_qr.py`) doesn't exist yet — see **Known gaps**. |
+| Magic link (demo) | `MAGIC_LINK_SECRET` | A signed token redeemed at `/auth/magic` drops the same session an OIDC login would, without running Authelia. Mint one with `backend/tools/make_magic_qr.py` (see FULL_INSTALLATION.md §6.7). |
 
 `SESSION_SECRET` is required whenever `REQUIRE_AUTH=1` — the backend refuses to start without one
 rather than fall back to a public default, since it's what makes the session cookie unforgeable.
@@ -178,6 +178,7 @@ rather than fall back to a public default, since it's what makes the session coo
   `0.1.0`); the `huri-modules` submodule pins a huri-modules commit of `dev` until the `0.1.0`
   tag exists, and must then be moved to it (`git -C huri-modules checkout 0.1.0`, commit the
   gitlink).
-- The magic-link auth mode's redemption endpoint (`/auth/magic`) works, but the tool to mint a
-  valid token (`tools/make_magic_qr.py`, referenced in `main.py`'s comments) hasn't been written
-  yet — that mode isn't usable until it exists.
+- The Control Panel runs `serve run` with huri-modules' `.huri-local/env.sh`, not the full
+  `.huri-local/start.sh`: it starts Qdrant/Ollama only when huri-modules provides a
+  `.huri-local/services.sh` (otherwise it probes them and warns in the panel), and the Ray head
+  `serve run` autostarts is sized to the whole machine. See FULL_INSTALLATION.md §6.5.

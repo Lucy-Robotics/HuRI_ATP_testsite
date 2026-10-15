@@ -365,7 +365,7 @@ purpose: every TTS request would fail silently at runtime.
 | `.huri-local/plan.env` | The hardware plan it acted on (profile, devices per module, endpoints). |
 | `.huri-local/huri.env` | The same runtime env vars as a sourceable `.env`. |
 | `.huri-local/secrets.env` | `HURI_LLM_API_KEY`, mode 0600. Present even when empty. |
-| `.huri-local/env.sh` | `source` it for a shell configured like a Serve replica: venv + `huri.env` + `secrets.env`. Needed for ingestion and for `python -m huri_core.launch_huri`; the ATP launcher sources it before `serve run`. |
+| `.huri-local/env.sh` | `source` it for a shell configured like a Serve replica: venv + `huri.env` + `secrets.env`. Needed for ingestion and for `python -m huri_core.launch_huri`; the ATP launcher sources it before `serve run` (and runs `.huri-local/services.sh` too when huri-modules provides one). |
 | `.huri-local/start.sh` / `stop.sh` / `status.sh` | Run the stack outside the ATP site (see §4.7). |
 | `.huri-local/install.log` | Everything the installer ran. |
 | `.huri-local/qdrant/`, `.huri-local/bin/qdrant` | Local Qdrant data / binary, only for a local Qdrant. |
@@ -406,8 +406,13 @@ Re-run only the config stage; nothing is reinstalled:
 ./install.sh --only config \
   --llm-url https://other.lan --llm-model other-model --llm-provider vllm \
   --embed-url … --embed-model … --qdrant-url … --no-verify-ssl
-.huri-local/stop.sh && .huri-local/start.sh      # or Stop/Start in the Control Panel
+.huri-local/stop.sh && .huri-local/start.sh
 ```
+
+Stop/Start in the Control Panel also picks up the new endpoints (the RAG block of the regenerated
+config and `env.sh`), but it does **not** start a Qdrant or Ollama that the new flags made local
+— run `start.sh` once for that, or start them yourself (§6.5 lists what the panel does and does
+not start).
 
 Pass the complete set of endpoint flags each time: `--only config` regenerates the whole file
 from the flags given (the API key is the one exception — it is reloaded from `secrets.env` when
@@ -509,9 +514,9 @@ reaches the replicas:
 - stored in `huri-modules/.huri-local/secrets.env` (0600), exported as `HURI_LLM_API_KEY`;
 - `start.sh` sources it before `ray start`, so replicas inherit it;
 - **when HuRI is launched from the ATP Control Panel**, the launcher sources
-  `huri-modules/.huri-local/env.sh` (which loads `secrets.env`) before `serve run`, exactly as
-  `start.sh` does, so nothing needs exporting. Without that file (a manual install), export the
-  key in the shell that starts the site instead.
+  `huri-modules/.huri-local/env.sh` (which loads `secrets.env`) before `serve run`, so the key
+  reaches the replicas as with `start.sh` and nothing needs exporting. Without that file (a
+  manual install), export the key in the shell that starts the site instead.
   A Ray cluster that is already up keeps its old environment: stop it before changing the key.
 
 ### 5.3 The embedding model
@@ -633,8 +638,20 @@ these scripts.
 
 Open <http://localhost:5173>, click **HuRI Control Panel** (top bar; it opens automatically
 when nothing is running), choose a config, **Start**. The backend runs `serve run <config>`
-with the huri-modules checkout as working directory (after sourcing its `.huri-local/env.sh`), tails its logs into the panel, and reports
-*running* once `GET /modules` answers (up to 90 s). Only one instance can run at a time.
+with the huri-modules checkout as working directory (after sourcing its `.huri-local/env.sh`),
+tails its logs into the panel, and reports *running* once `GET /modules` answers (up to 90 s).
+Only one instance can run at a time.
+
+The panel is **not** `.huri-local/start.sh`. That script ends in `serve deploy`, which detaches
+and returns, so the panel keeps a supervised `serve run` instead (its log tail and its Stop
+depend on it) and does only part of what `start.sh` does:
+
+| `start.sh` step | Control Panel |
+|---|---|
+| Source `env.sh` (venv, `huri.env`, `secrets.env`) | Yes. |
+| Start Qdrant (container or binary) and Ollama | Only when huri-modules ships them as `.huri-local/services.sh`, which the panel then runs before `serve run`. Otherwise **they are the operator's job**: the panel probes Qdrant's `/readyz` and, for an Ollama LLM, Ollama's `/api/tags` (URLs from the config's `RAGHandle` block, else `.huri-local/plan.env`, else `localhost:6333` / `localhost:11434`) and puts a warning in the log tail and in *last error* when one does not answer. Without Qdrant RAG silently returns nothing. Running `start.sh` once (then `stop.sh` without `--all`) leaves both services up for the panel. |
+| GPU pin (`HIP_VISIBLE_DEVICES` on multi-GPU AMD hosts) | Yes: taken from `env.sh`, or from `start.sh` when only `start.sh` exports it. |
+| `ray start --head --num-cpus=… --num-gpus=…` | **No.** `serve run` autostarts a Ray head sized to the whole machine (every CPU and GPU), not to the installer's `HURI_RAY_GPUS`. To size it, start the head yourself (`source .huri-local/env.sh && ray start --head --num-gpus=N`) before **Start**: `serve run` joins it. The panel's Stop ends with `ray stop`, which stops that head too. |
 
 The dropdown lists every `config/huri*.yaml` in the huri-modules checkout plus the copies under
 `presets/F*/`. **Not all of them are runnable on your machine**:
@@ -692,8 +709,10 @@ one RAG partition). For per-user memory or a public deployment:
 
 ## 7. Operating it
 
-**Start order.** Remote services first (they must answer before `RAGHandle` initialises), then
-`./scripts/run_all.sh`, then **Start** in the Control Panel (or `huri-modules/.huri-local/start.sh`).
+**Start order.** Qdrant and the LLM/embedding services first (they must answer before
+`RAGHandle` initialises; the Control Panel starts local ones only through a
+`.huri-local/services.sh`, see §6.5), then `./scripts/run_all.sh`, then **Start** in the Control
+Panel (or `huri-modules/.huri-local/start.sh`, which also starts local Qdrant and Ollama).
 `huri-modules/.huri-local/status.sh` shows every dependency in one screen.
 
 **Stop.** Ctrl-C in `run_all.sh` asks the launcher to stop HuRI (SIGINT to `serve run`, then

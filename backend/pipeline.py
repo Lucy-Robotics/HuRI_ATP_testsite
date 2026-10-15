@@ -2,8 +2,8 @@
 Parse HuRI gesture (motion) output into avatar animation frames.
 
 HuRI runs all inference (RAG, TTS, EMAGE gesture) remotely; the backend only
-receives the resulting motion chunks over the websocket, forwarded by
-HuRI/src/interfaces/web_interface.py and reshaped here via main.py's
+receives the resulting ``huri.motion`` events over its HuRI session, turned
+into raw arrays by huri_bridge.motion_message and reshaped here via main.py's
 ``_transform_outbound``. This module turns one chunk's raw arrays into the
 frame format the frontend consumes — no models, no torch, just numpy + scipy.
 """

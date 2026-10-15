@@ -7,6 +7,7 @@ python-multipart
 authlib
 itsdangerous
 httpx
+pyyaml
 # HuRI client SDK (websocket session, wire encoding) and the curated huri.*
 # events. Compatible with a HuRI server running huri-core 0.4.x / huri-modules
 # 0.1.x. No Ray, no torch: the server runs from the huri-modules submodule.

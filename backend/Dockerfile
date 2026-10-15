@@ -18,10 +18,7 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    # get_or_create_user_id() writes a fallback UUID here only when REQUIRE_AUTH
-    # is off; keep it on a writable path for the non-root user.
-    HURI_USER_ID_FILE=/tmp/.huri_user_id
+    PIP_NO_CACHE_DIR=1
 
 # libsndfile backs soundfile/librosa at runtime; git installs huri-core and
 # huri-events from their repositories (requirements.txt).

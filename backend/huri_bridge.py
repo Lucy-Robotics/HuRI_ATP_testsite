@@ -343,6 +343,33 @@ async def _teardown(client: HuRIClient, tasks: Iterable["asyncio.Task"]) -> None
     await client.close()
 
 
+async def _connect(
+    huri_url: str,
+    handshake: Any,
+    modules: Dict[str, Dict[str, Any]],
+    user_id: str,
+    outbound: "asyncio.Queue[Outbound]",
+) -> HuRIClient:
+    """A connected client for ``modules``. When HuRI refuses the session and
+    its ``server_modules`` map the handshake to other names (the browser's
+    ``tts`` on a CosyVoice-only server, when the module list was unknown
+    beforehand), retries once with those."""
+    client = make_client(huri_url, modules, user_id, outbound)
+    try:
+        await client.connect()
+        return client
+    except HuRISessionError as exc:
+        if not exc.server_modules:
+            raise
+        remapped = build_session_modules(handshake, exc.server_modules)
+        if remapped == modules:
+            raise
+    logger.info("Retrying the HuRI session with the server's module names")
+    client = make_client(huri_url, remapped, user_id, outbound)
+    await client.connect()
+    return client
+
+
 async def run_browser_session(
     ws: WebSocket,
     user_id: str,
@@ -374,9 +401,8 @@ async def run_browser_session(
         return
 
     outbound: "asyncio.Queue[Outbound]" = asyncio.Queue()
-    client = make_client(huri_url, modules, user_id, outbound)
     try:
-        await client.connect()
+        client = await _connect(huri_url, handshake, modules, user_id, outbound)
     except HuRISessionError as exc:
         message = f"HuRI refused the session: {exc.error}"
         if exc.server_modules:
@@ -392,6 +418,7 @@ async def run_browser_session(
         )
         await ws.close(code=1011)
         return
+    modules = client.modules
 
     await ws.send_json({"type": "session_config", "config": describe_config(modules)})
 
