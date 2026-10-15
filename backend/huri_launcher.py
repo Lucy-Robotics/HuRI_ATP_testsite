@@ -21,9 +21,11 @@ already up, else starts one sized to the whole machine.
 
 Single instance by design: HuRI binds fixed local ports. The process runs in
 its own process group, stopped with SIGINT (``serve run``'s controlled
-shutdown), then SIGKILL after a grace period. ``ray stop`` runs afterwards only
-when no Ray head was up before Start, i.e. when ``serve run`` started the one
-it ran on.
+shutdown), then SIGKILL for whatever is left of the group after a grace
+period. ``ray stop`` runs afterwards (after Stop, or after a crash) only when
+no Ray head was up before Start, i.e. when ``serve run`` started the one it ran
+on. A run is over only once that cleanup is done: Stop holds the lock until
+then, and Start first waits for a crashed run's cleanup.
 
 This spawns real local processes, so every route that touches it sits behind
 auth (main.py's ``_require_auth``).
@@ -274,6 +276,10 @@ class HuriLauncher:
                     "it where it was started."
                 )
 
+            # A crashed run may still be cleaning up (killing its group,
+            # `ray stop`): that must not reach the instance started below.
+            await self._finish_previous_run()
+
             self._log_lines.clear()
             self._exit_code = None
             self._last_error = None
@@ -292,12 +298,15 @@ class HuriLauncher:
                 start_new_session=True,
             )
             self._tasks = [
-                asyncio.create_task(self._read_logs()),
+                asyncio.create_task(self._read_logs()),  # first: see _finish_previous_run
                 asyncio.create_task(self._reap()),
                 asyncio.create_task(self._wait_ready()),
             ]
 
     async def stop(self) -> None:
+        # The whole sequence holds the lock: a Start clicked meanwhile waits
+        # until the process group is gone and `ray stop` (if any) returned,
+        # so this Stop cannot tear down the Ray head of the next run.
         async with self._lock:
             if self._status not in ("starting", "running"):
                 if await self._external_is_up():
@@ -308,18 +317,17 @@ class HuriLauncher:
                 raise NotRunningError(f"HuRI is not running (status={self._status}).")
             self._status = "stopping"
             proc = self._process
-        assert proc is not None
-        await self._terminate(proc)
-        # Let _reap record the exit (and the log reader drain) first.
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-
-        if self._ray_was_up:
-            self._log("[launcher] leaving the Ray head running (it was up before Start)")
-        else:
-            code, _ = await self._run("ray", "stop")
-            self._log(f"[launcher] ray stop (serve run started that head): exit {code}")
-        # The instance just stopped may sit in a cached "up" answer.
-        self._probe_cache = None
+            ray_was_up = self._ray_was_up
+            assert proc is not None
+            try:
+                await self._terminate(proc)
+                # Let _reap record the exit (and the log reader drain) first.
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+                await self._stop_ray_if_ours(ray_was_up)
+            finally:
+                self._status = "stopped"
+                # The instance just stopped may sit in a cached "up" answer.
+                self._probe_cache = None
 
     async def shutdown(self) -> None:
         """Stop the process this launcher owns, if any (backend shutdown)."""
@@ -329,24 +337,48 @@ class HuriLauncher:
             except NotRunningError:
                 pass
 
+    async def _stop_ray_if_ours(self, ray_was_up: bool) -> None:
+        if ray_was_up:
+            self._log("[launcher] leaving the Ray head running (it was up before Start)")
+            return
+        code, _ = await self._run("ray", "stop")
+        self._log(f"[launcher] ray stop (serve run started that head): exit {code}")
+
+    async def _finish_previous_run(self) -> None:
+        """Wait for the previous run's tasks (a crash's cleanup included).
+        The log reader is cancelled: a leftover that still holds the pipe
+        must not keep the next Start waiting."""
+        if self._tasks:
+            self._tasks[0].cancel()  # the log reader, see start()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+
     @staticmethod
-    def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> None:
+    def _signal_group(pgid: int, sig: int) -> bool:
+        """Signal process group ``pgid``: False when it no longer exists."""
         try:
-            os.killpg(proc.pid, sig)
+            os.killpg(pgid, sig)
         except ProcessLookupError:
-            pass
+            return False
+        return True
 
     async def _terminate(self, proc: asyncio.subprocess.Process) -> None:
         """SIGINT the process group (Ctrl-C: serve run shuts down cleanly),
-        SIGKILL it after the grace period."""
-        self._signal_group(proc, signal.SIGINT)
+        then SIGKILL whatever is left of the group after the grace period:
+        the leader exiting does not mean every child it started did."""
+        pgid = proc.pid  # start_new_session: the leader's pid is the group id
+        deadline = time.monotonic() + _STOP_GRACE_PERIOD
+        self._signal_group(pgid, signal.SIGINT)
         try:
             await asyncio.wait_for(proc.wait(), _STOP_GRACE_PERIOD)
         except asyncio.TimeoutError:
+            pass
+        while time.monotonic() < deadline and self._signal_group(pgid, 0):
+            await asyncio.sleep(0.1)
+        if self._signal_group(pgid, signal.SIGKILL):
             logger.warning("HuRI did not exit within %.0fs of SIGINT; killing.", _STOP_GRACE_PERIOD)
             self._log(f"[launcher] still running {_STOP_GRACE_PERIOD:.0f}s after SIGINT: SIGKILL")
-            self._signal_group(proc, signal.SIGKILL)
-            await proc.wait()
+        await proc.wait()
 
     async def _read_logs(self) -> None:
         assert self._process is not None and self._process.stdout is not None
@@ -379,12 +411,18 @@ class HuriLauncher:
 
     async def _reap(self) -> None:
         assert self._process is not None
-        returncode = await self._process.wait()
+        proc = self._process
+        returncode = await proc.wait()
         self._exit_code = returncode
         if self._status == "stopping":
-            self._status = "stopped"
-            return
+            return  # stop() finishes the cleanup, then reports "stopped"
+        ray_was_up = self._ray_was_up
         self._status = "crashed"
         self._last_error = f"HuRI exited unexpectedly (code {returncode}): see the logs."
         logger.warning("HuRI process exited unexpectedly (code %s)", returncode)
         await self._dependency_hint()
+        # Nothing stops a crashed run, so clean up here what Stop would have:
+        # what is left of its process group, and the Ray head it started.
+        if self._signal_group(proc.pid, signal.SIGKILL):
+            self._log("[launcher] killed what was left of the crashed run's process group")
+        await self._stop_ray_if_ours(ray_was_up)
