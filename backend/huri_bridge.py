@@ -1,35 +1,32 @@
 """Bridges one browser websocket to a HuRI session, through huri-core's client
 SDK (``huri_core.core.client.HuRIClient``).
 
-The browser protocol on ``/ws`` is this website's own and is unchanged by the
-move to the SDK (the frontend and its built bundle in ``static/`` are not
-touched):
+The browser protocol on ``/ws`` (this file is its reference):
 
-  1. the browser sends one handshake: ``{"modules": {tag: {name, args}}}``;
+  1. the browser sends one handshake: ``{"modules": {tag: {name, args}}}``,
+     the ``modules`` block of a HuRI session with the server's module names
+     (``vad``, ``stt``, ``rag``, ``tts`` / ``tts_cosyvoice``, ``mov``...);
   2. the backend opens the HuRI session and replies
-     ``{"type": "session_config", "config": {...}}`` (:func:`describe_config`),
-     or ``{"type": "error", "message": ...}`` when HuRI refuses it;
+     ``{"type": "session_config", "config": {"modules": {...}}}``, or
+     ``{"type": "error", "message": ...}`` when it cannot;
   3. inbound: binary frames are mic PCM (int16, 16 kHz: ``huri.audio.in``);
      JSON frames are ``{"topic": "question"|"token", "text": ...}``, the
      Composer's event dropdown ("rag.in" vs "rag.out" in the ATP's terms);
-  4. outbound: ``{"type": "token"|"audio"|"motion"|"question", ...}``, each
-     passed through ``transform_outbound`` (main.py turns ``"motion"`` into
-     this frontend's ``"segment"`` rig frames).
+  4. outbound: ``{"type": "token"|"audio"|"segment"|"question"|"error", ...}``.
+     The bridge emits ``"motion"`` (raw SMPL-X arrays); main.py's
+     ``transform_outbound`` turns it into this frontend's ``"segment"`` rig
+     frames before it reaches the browser.
 
-Module names: the frontend still speaks the names of the HuRI monorepo
-(``mic``, ``gesture``, ``tts``), while the curated modules of huri-modules are
-``vad``, ``mov`` and ``tts`` (Piper, CPU) / ``tts_cosyvoice`` (CosyVoice3,
-GPU). :func:`to_server_name` and :func:`to_browser_name` translate both ways
-at this boundary, so the frontend, its presets dropdown and the HuRI server
-each keep their own vocabulary. The preset files under ``presets/`` use the
-server's names (the same ``modules:`` block a huri-cli client config holds).
+The browser receives the outputs of the session's modules that it has a
+message for: each module's output topic comes from the server's
+``GET /modules`` details.
 """
 
 import asyncio
 import base64
 import json
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
 import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
@@ -39,44 +36,11 @@ from huri_events import Audio, Motion, RAGQuestion, Token, Transcript
 
 logger = logging.getLogger(__name__)
 
-# Curated topics (huri-events) this bridge sends and receives.
 TOPIC_AUDIO_IN = "huri.audio.in"
 TOPIC_QUESTION = "huri.question"
 TOPIC_TOKEN = "huri.token"
 TOPIC_AUDIO_OUT = "huri.audio.out"
 TOPIC_MOTION = "huri.motion"
-
-# Browser (HuRI monorepo) name -> huri-modules name. "tts" is not here: it
-# names both the browser's speech module and huri-modules' Piper engine, and
-# resolves against the server (see to_server_name).
-_SERVER_NAME = {"mic": "vad", "gesture": "mov"}
-# huri-modules name -> browser name: the inverse, plus CosyVoice shown as "tts".
-_BROWSER_NAME = {"vad": "mic", "mov": "gesture", "tts_cosyvoice": "tts"}
-_TTS_ENGINES = ("tts", "tts_cosyvoice")
-
-# Server module -> the topic the browser subscribes to when the module is in
-# the session. HuRI rejects a subscription to a topic no module of the session
-# produces, so subscriptions follow the requested modules.
-#
-# No "emo" -> "huri.emotion" entry: that is EMO's raw per-chunk read, which
-# only travels between modules. The utterance-final read QAG links onto
-# RAGQuestion.emotion reaches the browser with the "question" message.
-_SUBSCRIPTION_BY_PRODUCER = {
-    "rag": TOPIC_TOKEN,
-    "tts": TOPIC_AUDIO_OUT,
-    "tts_cosyvoice": TOPIC_AUDIO_OUT,
-    "mov": TOPIC_MOTION,
-    "qag": TOPIC_QUESTION,
-}
-
-# Key of each subscription in the session_config's "hooks" (the names the
-# HuRI monorepo's web interface used).
-_HOOK_KEY = {
-    TOPIC_TOKEN: "token",
-    TOPIC_AUDIO_OUT: "audio",
-    TOPIC_MOTION: "motion",
-    TOPIC_QUESTION: "question",
-}
 
 # Always offered: a sent topic nothing in the session consumes is accepted by
 # HuRI and dropped, which lets a tester target huri.token directly (rag.out)
@@ -85,52 +49,15 @@ SENDS = [TOPIC_AUDIO_IN, TOPIC_QUESTION, TOPIC_TOKEN]
 
 Outbound = Dict[str, Any]
 TransformOutbound = Callable[[Outbound], Outbound]
+# GET /modules "details": {module name: {"input", "output", "actuation"}}.
+ModuleDetails = Mapping[str, Mapping[str, Any]]
 
 
 class InvalidHandshake(ValueError):
     """The browser's handshake does not describe a session."""
 
 
-def to_server_name(name: str, server_modules: Optional[Iterable[str]] = None) -> str:
-    """The huri-modules name of a module the browser asked for.
-
-    The browser's ``tts`` becomes whichever TTS engine the server enabled:
-    ``tts`` (Piper) when it has it or when the server's modules are unknown,
-    else ``tts_cosyvoice`` (config/huri.yaml enables only CosyVoice). New
-    names (``vad``, ``mov``, ``tts_cosyvoice``...) pass through unchanged.
-    """
-    if name == "tts" and server_modules is not None:
-        available = set(server_modules)
-        if "tts" not in available and "tts_cosyvoice" in available:
-            return "tts_cosyvoice"
-    return _SERVER_NAME.get(name, name)
-
-
-def to_browser_name(name: str) -> str:
-    """The frontend's name of a huri-modules module (``vad`` -> ``mic``)."""
-    return _BROWSER_NAME.get(name, name)
-
-
-def browser_module_names(server_modules: Iterable[str]) -> List[str]:
-    """A server's module list (GET /modules) in the frontend's vocabulary,
-    sorted and without duplicates (both TTS engines show as ``tts``)."""
-    return sorted({to_browser_name(name) for name in server_modules})
-
-
-def to_browser_modules(modules: Mapping[str, Any]) -> Dict[str, Any]:
-    """A ``modules`` block (a preset file, or a session) renamed for the
-    frontend. Entries that are not ``{name, args}`` objects pass through."""
-    renamed: Dict[str, Any] = {}
-    for tag, entry in modules.items():
-        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
-            entry = {**entry, "name": to_browser_name(entry["name"])}
-        renamed[tag] = entry
-    return renamed
-
-
-def build_session_modules(
-    handshake: Any, server_modules: Optional[Iterable[str]] = None
-) -> Dict[str, Dict[str, Any]]:
+def build_session_modules(handshake: Any) -> Dict[str, Dict[str, Any]]:
     """The HuRI ``modules`` block of a browser handshake.
 
     ``handshake["modules"]`` is ``{tag: {"name": <module>, "args": {...}}}``
@@ -144,7 +71,6 @@ def build_session_modules(
     if not isinstance(requested, Mapping) or not requested:
         raise InvalidHandshake("the handshake needs a non-empty 'modules' object")
 
-    server_list = list(server_modules) if server_modules is not None else None
     modules: Dict[str, Dict[str, Any]] = {}
     for tag, entry in requested.items():
         if not isinstance(entry, Mapping):
@@ -158,10 +84,7 @@ def build_session_modules(
         if isinstance(path, str) and name is None:
             modules[str(tag)] = {"module": path, "args": dict(args)}
         elif isinstance(name, str) and path is None:
-            modules[str(tag)] = {
-                "name": to_server_name(name, server_list),
-                "args": dict(args),
-            }
+            modules[str(tag)] = {"name": name, "args": dict(args)}
         else:
             raise InvalidHandshake(
                 f"module {tag!r} needs exactly one of 'name' or 'module'"
@@ -169,37 +92,10 @@ def build_session_modules(
     return modules
 
 
-def subscriptions(modules: Mapping[str, Mapping[str, Any]]) -> List[str]:
-    """Topics the browser receives for this session's modules."""
-    names = {m.get("name") for m in modules.values()}
-    return sorted(
-        {topic for name, topic in _SUBSCRIPTION_BY_PRODUCER.items() if name in names}
-    )
-
-
 def describe_config(modules: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
-    """The ``session_config`` echoed to the browser: the session's modules in
-    the frontend's names (it renders the mic button, the avatar... from them),
-    the senders and hooks in the shape the HuRI monorepo's web interface gave,
-    and the modules as HuRI actually runs them."""
-    topics = subscriptions(modules)
-    return {
-        "modules": to_browser_modules(modules),
-        "senders": {
-            "audio": {"name": "web_audio", "topic": TOPIC_AUDIO_IN, "args": {}},
-            "text": {"name": "web_text", "topic": TOPIC_QUESTION, "args": {}},
-            "token": {"name": "web_token", "topic": TOPIC_TOKEN, "args": {}},
-        },
-        "hooks": {
-            _HOOK_KEY[topic]: {
-                "name": "web_" + _HOOK_KEY[topic],
-                "topics": [topic],
-                "args": {},
-            }
-            for topic in topics
-        },
-        "huri_modules": {k: dict(v) for k, v in modules.items()},
-    }
+    """The ``session_config`` echoed to the browser: the session's modules
+    (it renders the mic button, the avatar... from them)."""
+    return {"modules": {tag: dict(entry) for tag, entry in modules.items()}}
 
 
 # --- HuRI events -> browser messages ----------------------------------------
@@ -254,6 +150,8 @@ def question_message(event: RAGQuestion) -> Outbound:
     }
 
 
+# The topics the browser has a message for. Not huri.emotion: that is EMO's
+# raw per-chunk read; the utterance-final one rides on RAGQuestion.emotion.
 _HANDLERS = {
     TOPIC_TOKEN: (Token, token_message),
     TOPIC_AUDIO_OUT: (Audio, audio_message),
@@ -262,19 +160,34 @@ _HANDLERS = {
 }
 
 
+def subscriptions(
+    modules: Mapping[str, Mapping[str, Any]], details: ModuleDetails
+) -> List[str]:
+    """Topics the browser receives: the output topics (per the server's
+    ``GET /modules`` details) of the session's modules that the bridge has a
+    browser message for. HuRI refuses a subscription to a topic no module of
+    the session produces, so this follows the requested modules."""
+    outputs = {
+        (details.get(entry.get("name")) or {}).get("output")
+        for entry in modules.values()
+    }
+    return sorted(outputs & _HANDLERS.keys())
+
+
 # --- session ------------------------------------------------------------------
 
 
 def make_client(
     huri_url: str,
     modules: Mapping[str, Mapping[str, Any]],
+    topics: List[str],
     user_id: str,
     outbound: "asyncio.Queue[Outbound]",
 ) -> HuRIClient:
-    """A HuRI client for the session whose every subscribed event is turned
-    into its browser message and queued on ``outbound``."""
+    """A HuRI client for the session whose every event on ``topics`` is
+    turned into its browser message and queued on ``outbound``."""
     client = HuRIClient(huri_url, modules=modules, sends=SENDS, user_id=user_id)
-    for topic in subscriptions(modules):
+    for topic in topics:
         event_cls, to_message = _HANDLERS[topic]
 
         async def forward(event: Any, to_message: Callable = to_message) -> None:
@@ -335,105 +248,79 @@ async def _pump_inbound(ws: WebSocket, client: HuRIClient) -> None:
 _TEARDOWNS: "set[asyncio.Task]" = set()
 
 
-async def _teardown(client: HuRIClient, tasks: Iterable["asyncio.Task"]) -> None:
-    tasks = list(tasks)
+async def _teardown(client: HuRIClient, tasks: List["asyncio.Task"]) -> None:
+    """Cancel the session's tasks (any that were created) and close HuRI."""
     for task in tasks:
         task.cancel()
-    await asyncio.wait(tasks)
+    if tasks:
+        await asyncio.wait(tasks)
     await client.close()
 
 
-async def _connect(
-    huri_url: str,
-    handshake: Any,
-    modules: Dict[str, Dict[str, Any]],
-    user_id: str,
-    outbound: "asyncio.Queue[Outbound]",
-) -> HuRIClient:
-    """A connected client for ``modules``. When HuRI refuses the session and
-    its ``server_modules`` map the handshake to other names (the browser's
-    ``tts`` on a CosyVoice-only server, when the module list was unknown
-    beforehand), retries once with those."""
-    client = make_client(huri_url, modules, user_id, outbound)
-    try:
-        await client.connect()
-        return client
-    except HuRISessionError as exc:
-        if not exc.server_modules:
-            raise
-        remapped = build_session_modules(handshake, exc.server_modules)
-        if remapped == modules:
-            raise
-    logger.info("Retrying the HuRI session with the server's module names")
-    client = make_client(huri_url, remapped, user_id, outbound)
-    await client.connect()
-    return client
+async def _refuse(ws: WebSocket, message: str, code: int) -> None:
+    await ws.send_json({"type": "error", "message": message})
+    await ws.close(code=code)
 
 
 async def run_browser_session(
     ws: WebSocket,
     user_id: str,
     huri_url: str,
-    server_modules: Optional[Callable[[], Any]] = None,
+    module_details: Callable[[], Awaitable[Optional[ModuleDetails]]],
     transform_outbound: Optional[TransformOutbound] = None,
 ) -> None:
     """Drive one browser<->HuRI session end to end. ``ws`` is already accepted
-    (the caller owns auth).
-
-    ``server_modules``, if given, is an async callable returning the module
-    names the HuRI server enabled (or None when unknown): it picks the TTS
-    engine the browser's ``tts`` means.
-    """
+    (the caller owns auth). ``module_details`` returns the server's
+    ``GET /modules`` details, or None when they cannot be read."""
     try:
         handshake = await ws.receive_json()
     except Exception:
         await ws.close(code=1002)
         return
 
-    available = await server_modules() if server_modules is not None else None
     try:
-        modules = build_session_modules(handshake, available)
+        modules = build_session_modules(handshake)
     except InvalidHandshake as exc:
-        await ws.send_json(
-            {"type": "error", "message": f"invalid or missing session config: {exc}"}
-        )
-        await ws.close(code=1008)
+        await _refuse(ws, f"invalid or missing session config: {exc}", 1008)
+        return
+
+    details = await module_details()
+    if details is None:
+        await _refuse(ws, f"Could not reach HuRI's module list (GET /modules) for {huri_url}", 1011)
         return
 
     outbound: "asyncio.Queue[Outbound]" = asyncio.Queue()
+    client = make_client(huri_url, modules, subscriptions(modules, details), user_id, outbound)
     try:
-        client = await _connect(huri_url, handshake, modules, user_id, outbound)
+        await client.connect()
     except HuRISessionError as exc:
         message = f"HuRI refused the session: {exc.error}"
         if exc.server_modules:
             message += f" (server modules: {', '.join(exc.server_modules)})"
         logger.warning("HuRI refused the session: %s", exc.error)
-        await ws.send_json({"type": "error", "message": message})
-        await ws.close(code=1011)
+        await _refuse(ws, message, 1011)
         return
     except Exception as exc:  # unreachable server, bad URL...
         logger.warning("Could not reach HuRI at %s: %s", huri_url, exc)
-        await ws.send_json(
-            {"type": "error", "message": f"Could not reach HuRI at {huri_url}: {exc}"}
-        )
-        await ws.close(code=1011)
+        await _refuse(ws, f"Could not reach HuRI at {huri_url}: {exc}", 1011)
         return
-    modules = client.modules
 
-    await ws.send_json({"type": "session_config", "config": describe_config(modules)})
-
-    huri_task = asyncio.create_task(client.wait_closed())
-    inbound_task = asyncio.create_task(_pump_inbound(ws, client))
-    writer_task = asyncio.create_task(
-        _pump_outbound(outbound, ws, transform_outbound)
-    )
+    tasks: List[asyncio.Task] = []
     try:
+        await ws.send_json(
+            {"type": "session_config", "config": describe_config(client.modules)}
+        )
+        huri_task = asyncio.create_task(client.wait_closed())
+        tasks.append(huri_task)
+        inbound_task = asyncio.create_task(_pump_inbound(ws, client))
+        tasks.append(inbound_task)
+        writer_task = asyncio.create_task(
+            _pump_outbound(outbound, ws, transform_outbound)
+        )
+        tasks.append(writer_task)
         # Race the browser's input against HuRI closing the session under us,
         # so the browser hears about it instead of waiting on a dead session.
-        done, _ = await asyncio.wait(
-            {huri_task, inbound_task, writer_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         if huri_task in done:
             logger.warning("HuRI closed the session (user_id=%s)", user_id)
             try:
@@ -452,9 +339,7 @@ async def run_browser_session(
         # cancels this handler mid-teardown (shutdown, or a test client
         # closing), and that cancellation reaches the handler once, as the
         # server's own cancel scope expects.
-        teardown = asyncio.create_task(
-            _teardown(client, (huri_task, inbound_task, writer_task))
-        )
+        teardown = asyncio.create_task(_teardown(client, tasks))
         _TEARDOWNS.add(teardown)
         teardown.add_done_callback(_TEARDOWNS.discard)
         await asyncio.shield(teardown)

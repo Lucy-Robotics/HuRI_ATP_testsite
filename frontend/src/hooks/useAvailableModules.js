@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
 import { BACKEND_URL } from "../config.js";
 
-/** Which modules the connected HuRI instance actually has deployed (see
- * backend/main.py's /huri-modules, which proxies HuRI/src/core/huri.py's
- * "/modules" route) — `null` means "couldn't ask" (don't block on it), as
- * opposed to an empty array (asked, HuRI has nothing registered). */
+/** The modules the connected HuRI instance serves (backend/main.py's
+ * /huri-modules, a proxy of HuRI's GET /modules), in the server's names.
+ * `null` means "couldn't ask" (don't block on it), as opposed to an empty
+ * array (asked, HuRI serves nothing). */
 export function useAvailableModules() {
   const [availableModules, setAvailableModules] = useState(null);
 
@@ -16,11 +16,4 @@ export function useAvailableModules() {
   }, []);
 
   return availableModules;
-}
-
-/** Whether every module a preset needs is actually deployed on this HuRI
- * instance (unknown availability = don't block anything). */
-export function presetIsAvailable(preset, availableModules) {
-  if (!availableModules) return true;
-  return Object.values(preset).every((m) => availableModules.includes(m.name));
 }

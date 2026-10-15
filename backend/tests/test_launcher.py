@@ -1,16 +1,22 @@
-"""HuriLauncher: where the huri-modules checkout, its binaries and the
-launchable configs are found, and the command it runs."""
+"""HuriLauncher: where the huri-modules checkout and its launchable configs
+are found, and the lifecycle of the ``serve run`` process it supervises
+(started through the installer's env.sh, stopped as a process group, Ray
+stopped only when this run started it)."""
 
 import asyncio
+import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
 
+import huri_launcher
 from huri_launcher import (
     HuriLauncher,
-    rag_endpoints,
-    resolve_bin,
+    NotInstalledError,
+    NotRunningError,
+    UnknownConfigError,
     resolve_modules_path,
 )
 
@@ -30,6 +36,42 @@ def _executable(path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/env bash\n" + body)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def _installed(tmp_path: Path, serve: str, ray_status_code: int = 1) -> Path:
+    """A huri-modules checkout whose env.sh puts fake ``serve``/``ray`` on
+    PATH. ``ray status`` exits ``ray_status_code``; ``ray stop`` is recorded
+    in ``ray.log``."""
+    modules = _checkout(tmp_path / "huri-modules")
+    bin_dir = tmp_path / "bin"
+    _executable(bin_dir / "serve", serve)
+    _executable(
+        bin_dir / "ray",
+        f'echo "$*" >> "{tmp_path}/ray.log"\n'
+        f'[ "$1" = status ] && exit {ray_status_code}\nexit 0\n',
+    )
+    local = modules / ".huri-local"
+    local.mkdir()
+    (local / "env.sh").write_text(
+        f'export PATH="{bin_dir}:$PATH"\nexport HURI_MODULES=vad,stt\n'
+    )
+    return modules
+
+
+async def _wait_for(predicate, timeout: float = 5.0) -> None:
+    deadline = time.time() + timeout
+    while not predicate():
+        if time.time() > deadline:
+            raise AssertionError("condition not met in time")
+        await asyncio.sleep(0.05)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 # --- resolve_modules_path ------------------------------------------------------------
@@ -56,248 +98,167 @@ def test_uninitialized_submodule_falls_back_to_its_path(tmp_path):
     assert resolve_modules_path({}, site) == site / "huri-modules"
 
 
-# --- binaries ----------------------------------------------------------------------------
+# --- configs and installation -------------------------------------------------------------
 
 
-def test_bin_override_then_installer_venv_then_path(tmp_path):
-    modules = _checkout(tmp_path / "huri-modules")
-    assert resolve_bin({}, "HURI_SERVE_BIN", modules, "serve") == "serve"
-    serve = _executable(modules / ".venv" / "bin" / "serve", "exit 0\n")
-    assert resolve_bin({}, "HURI_SERVE_BIN", modules, "serve") == str(serve)
-    env = {"HURI_SERVE_BIN": "/usr/local/bin/serve"}
-    assert resolve_bin(env, "HURI_SERVE_BIN", modules, "serve") == "/usr/local/bin/serve"
-
-
-# --- configs ------------------------------------------------------------------------------
-
-
-def test_configs_from_huri_modules_and_presets(tmp_path):
+def test_configs_are_huri_modules_serve_configs(tmp_path):
     modules = _checkout(
         tmp_path / "huri-modules",
         ("huri.yaml", "huri_cpu.yaml", "huri_local.generated.yaml", "client_template.yaml"),
     )
-    presets = tmp_path / "presets"
-    for name in ("F1/huri.yaml", "F1/huri_cpu.yaml", "F9/huri.yaml", "F9/rag_only.json"):
-        (presets / name).parent.mkdir(parents=True, exist_ok=True)
-        (presets / name).write_text("{}\n")
-    launcher = HuriLauncher(modules, UNREACHABLE, presets_dir=presets, environ={})
+    launcher = HuriLauncher(modules, UNREACHABLE)
     assert launcher.list_configs() == [
-        "F1/huri.yaml",
-        "F1/huri_cpu.yaml",
-        "F9/huri.yaml",
         "huri.yaml",
         "huri_cpu.yaml",
         "huri_local.generated.yaml",
     ]
-    configs = launcher._discover_configs()
-    assert configs["huri.yaml"] == modules / "config" / "huri.yaml"
-    assert configs["F9/huri.yaml"] == presets / "F9" / "huri.yaml"
 
 
 def test_configs_without_a_checkout(tmp_path):
-    launcher = HuriLauncher(
-        tmp_path / "missing", UNREACHABLE, presets_dir=REPO_ROOT / "presets", environ={}
-    )
-    configs = launcher.list_configs()
-    assert "F1/huri_cpu.yaml" in configs
-    assert all(c.startswith("F") for c in configs)
+    launcher = HuriLauncher(tmp_path / "missing", UNREACHABLE)
+    assert launcher.list_configs() == []
+    assert "No huri-modules checkout" in launcher.install_problem()
 
 
-def test_repo_presets_are_all_launchable():
-    launcher = HuriLauncher(
-        resolve_modules_path({}, REPO_ROOT),
-        UNREACHABLE,
-        presets_dir=REPO_ROOT / "presets",
-        environ={},
-    )
-    configs = launcher.list_configs()
-    assert {f"F{i}/huri.yaml" for i in range(1, 12)} <= set(configs)
-    if (REPO_ROOT / "huri-modules" / "config").is_dir():
-        assert {"huri.yaml", "huri_cpu.yaml"} <= set(configs)
+def test_repo_submodule_configs():
+    modules = resolve_modules_path({}, REPO_ROOT)
+    if not (modules / "config").is_dir():
+        pytest.skip("huri-modules submodule not checked out")
+    assert {"huri.yaml", "huri_cpu.yaml"} <= set(HuriLauncher(modules, UNREACHABLE).list_configs())
 
 
-# --- command --------------------------------------------------------------------------------
+def test_uninstalled_checkout_is_refused(tmp_path):
+    launcher = HuriLauncher(_checkout(tmp_path / "huri-modules"), UNREACHABLE)
+    assert "run its ./install.sh" in launcher.install_problem()
+    with pytest.raises(NotInstalledError):
+        asyncio.run(launcher.start("huri.yaml"))
 
 
-def test_command_without_installer_env(tmp_path):
-    modules = _checkout(tmp_path / "huri-modules")
-    launcher = HuriLauncher(modules, UNREACHABLE, environ={"HURI_SERVE_BIN": "srv"})
-    config = modules / "config" / "huri.yaml"
-    assert launcher.command_for(config) == ["srv", "run", str(config)]
+def test_unknown_config_is_refused(tmp_path):
+    launcher = HuriLauncher(_checkout(tmp_path / "huri-modules"), UNREACHABLE)
+    with pytest.raises(UnknownConfigError):
+        asyncio.run(launcher.start("../../etc/passwd"))
 
 
 def test_command_sources_the_installer_env(tmp_path):
     modules = _checkout(tmp_path / "huri-modules")
-    env_sh = modules / ".huri-local" / "env.sh"
-    env_sh.parent.mkdir()
-    env_sh.write_text("export HURI_MODULES=rag\n")
-    serve = _executable(modules / ".venv" / "bin" / "serve", "exit 0\n")
-    launcher = HuriLauncher(modules, UNREACHABLE, environ={})
-    config = tmp_path / "presets" / "F9" / "huri.yaml"
-    argv = launcher.command_for(config)
+    launcher = HuriLauncher(modules, UNREACHABLE)
+    argv = launcher.command_for("serve", "run", "cfg.yaml")
     assert argv[:2] == ["bash", "-c"]
-    assert argv[3:] == [str(env_sh), str(serve), str(config)]
+    assert argv[3:] == [str(modules / ".huri-local" / "env.sh"), "serve", "run", "cfg.yaml"]
 
 
-def test_command_runs_the_services_script_first(tmp_path):
-    modules = _checkout(tmp_path / "huri-modules")
-    local = modules / ".huri-local"
-    local.mkdir()
-    (local / "env.sh").write_text("")
-    (local / "services.sh").write_text("")
-    launcher = HuriLauncher(modules, UNREACHABLE, environ={"HURI_SERVE_BIN": "srv"})
-    config = modules / "config" / "huri.yaml"
-    argv = launcher.command_for(config)
-    assert argv[2] == 'source "$0" && bash "$3" && exec "$1" run "$2"'
-    assert argv[3:] == [
-        str(local / "env.sh"), "srv", str(config), str(local / "services.sh")
-    ]
-
-
-def test_gpu_pin_comes_from_start_sh_unless_env_sh_has_it(tmp_path):
-    modules = _checkout(tmp_path / "huri-modules")
-    local = modules / ".huri-local"
-    local.mkdir()
-    (local / "env.sh").write_text("export HSA_OVERRIDE_GFX_VERSION=11.0.0\n")
-    (local / "start.sh").write_text(
-        "#!/usr/bin/env bash\nexport HIP_VISIBLE_DEVICES=1\nray start --head\n"
-    )
-    launcher = HuriLauncher(modules, UNREACHABLE, environ={})
-    assert launcher.gpu_pin() == {"HIP_VISIBLE_DEVICES": "1"}
-    (local / "env.sh").write_text("export HIP_VISIBLE_DEVICES=1\n")
-    assert launcher.gpu_pin() == {}
-    (local / "start.sh").unlink()
-    assert launcher.gpu_pin() == {}
-
-
-_RAG_CONFIG = """
-applications:
-  - name: huri-app
-    deployments:
-      - name: HuRI
-      - name: RAGHandle
-        user_config:
-          qdrant_url: "{qdrant}"
-          llm_provider: "{provider}"
-          llm_url: "{llm}"
-"""
-
-
-def test_rag_endpoints(tmp_path):
-    config = tmp_path / "huri.yaml"
-    config.write_text(
-        _RAG_CONFIG.format(qdrant="https://q.lan/", provider="vllm", llm="http://l:8080")
-    )
-    assert rag_endpoints(config, {}) == {
-        "qdrant_url": "https://q.lan",
-        "llm_url": "http://l:8080",
-        "ollama": False,
-    }
-    # The hand-written templates name neither: plan.env, then RAG's defaults.
-    config.write_text("applications:\n  - deployments:\n      - name: RAGHandle\n")
-    plan = {"HURI_QDRANT_URL": "http://q:6333", "HURI_LLM_PROVIDER": "ollama"}
-    assert rag_endpoints(config, plan) == {
-        "qdrant_url": "http://q:6333",
-        "llm_url": "http://localhost:11434",
-        "ollama": True,
-    }
-    assert rag_endpoints(config, {})["ollama"] is True
-    config.write_text("applications:\n  - deployments:\n      - name: HuRI\n")
-    assert rag_endpoints(config, {}) is None
-    assert rag_endpoints(tmp_path / "missing.yaml", {}) is None
-
-
-def test_dead_services_are_reported_before_launch(tmp_path):
-    modules = _checkout(tmp_path / "huri-modules")
-    (modules / "config" / "huri.yaml").write_text(
-        _RAG_CONFIG.format(qdrant=UNREACHABLE, provider="ollama", llm=UNREACHABLE)
-    )
-    _executable(modules / ".venv" / "bin" / "serve", "exec sleep 30\n")
-    _executable(modules / ".venv" / "bin" / "ray", "exit 0\n")
-
-    async def scenario():
-        launcher = HuriLauncher(modules, UNREACHABLE, environ={})
-        await launcher.start("huri.yaml")
-        status, logs = await launcher.status(), launcher.logs()
-        await launcher.stop()
-        return status, logs
-
-    status, logs = asyncio.run(scenario())
-    assert "Qdrant is not answering" in status["last_error"]
-    assert "Ollama is not answering" in status["last_error"]
-    assert any("WARNING: Qdrant is not answering" in line for line in logs)
-
-
-def test_services_script_replaces_the_probe(tmp_path):
-    modules = _checkout(tmp_path / "huri-modules")
-    (modules / "config" / "huri.yaml").write_text(
-        _RAG_CONFIG.format(qdrant=UNREACHABLE, provider="ollama", llm=UNREACHABLE)
-    )
-    local = modules / ".huri-local"
-    local.mkdir()
-    (local / "env.sh").write_text("")
-    (local / "services.sh").write_text('echo "services up"\n')
-    _executable(modules / ".venv" / "bin" / "serve", 'echo "serve $1"\nexec sleep 30\n')
-    _executable(modules / ".venv" / "bin" / "ray", "exit 0\n")
-
-    async def scenario():
-        launcher = HuriLauncher(modules, UNREACHABLE, environ={})
-        await launcher.start("huri.yaml")
-        for _ in range(100):
-            if len(launcher.logs()) >= 2:
-                break
-            await asyncio.sleep(0.05)
-        status, logs = await launcher.status(), launcher.logs()
-        await launcher.stop()
-        return status, logs
-
-    status, logs = asyncio.run(scenario())
-    assert status["last_error"] is None
-    assert [line.split("] ", 1)[1] for line in logs] == ["services up", "serve run"]
+# --- lifecycle ------------------------------------------------------------------------------
 
 
 def test_start_runs_serve_from_the_checkout(tmp_path):
-    """The real start(): the process runs in the huri-modules checkout with
-    the installer environment, and stop() tears it down."""
-    modules = _checkout(tmp_path / "huri-modules")
-    env_sh = modules / ".huri-local" / "env.sh"
-    env_sh.parent.mkdir()
-    env_sh.write_text("export HURI_MODULES=vad,stt\n")
-    _executable(
-        modules / ".venv" / "bin" / "serve",
-        'echo "cwd=$PWD args=$* modules=$HURI_MODULES"\nexec sleep 30\n',
+    """The process runs in the huri-modules checkout with env.sh sourced, and
+    stop() tears it down."""
+    modules = _installed(
+        tmp_path, 'echo "cwd=$PWD args=$* modules=$HURI_MODULES"\nexec sleep 30\n'
     )
-    _executable(modules / ".venv" / "bin" / "ray", "exit 0\n")
 
     async def scenario():
-        launcher = HuriLauncher(modules, UNREACHABLE, environ={})
+        launcher = HuriLauncher(modules, UNREACHABLE)
         await launcher.start("huri_cpu.yaml")
-        for _ in range(100):
-            if launcher.logs():
-                break
-            await asyncio.sleep(0.05)
-        status = await launcher.status()
-        logs = launcher.logs()
+        await _wait_for(lambda: launcher.logs())
+        status, logs = await launcher.status(), launcher.logs()
         await launcher.stop()
         return status, logs, await launcher.status()
 
     status, logs, after = asyncio.run(scenario())
     assert status["status"] == "starting" and status["config"] == "huri_cpu.yaml"
     config = modules / "config" / "huri_cpu.yaml"
-    assert logs[0].endswith(f"cwd={modules} args=run {config} modules=vad,stt")
+    assert logs[-1].endswith(f"cwd={modules} args=run {config} modules=vad,stt")
     assert after["status"] == "stopped"
 
 
-def test_unknown_config_is_refused(tmp_path):
-    from huri_launcher import UnknownConfigError
+def test_stop_kills_the_whole_process_group(tmp_path, monkeypatch):
+    """A serve run that ignores SIGINT is SIGKILLed after the grace period,
+    with the children it started."""
+    monkeypatch.setattr(huri_launcher, "_STOP_GRACE_PERIOD", 0.5)
+    child_pid = tmp_path / "child.pid"
+    modules = _installed(
+        tmp_path,
+        "trap '' INT\n"
+        f'sleep 30 &\necho $! > "{child_pid}"\necho ready\nwait\n',
+    )
 
-    modules = _checkout(tmp_path / "huri-modules")
-    launcher = HuriLauncher(modules, UNREACHABLE, environ={})
-    with pytest.raises(UnknownConfigError):
-        asyncio.run(launcher.start("../../etc/passwd"))
+    async def scenario():
+        launcher = HuriLauncher(modules, UNREACHABLE)
+        await launcher.start("huri.yaml")
+        await _wait_for(lambda: any(line.endswith("ready") for line in launcher.logs()))
+        pid = int(child_pid.read_text())
+        assert _alive(pid)
+        await launcher.stop()
+        return pid, launcher.logs(), await launcher.status()
+
+    pid, logs, status = asyncio.run(scenario())
+    assert any("SIGKILL" in line for line in logs)
+    assert status["status"] == "stopped"
+    assert not _alive(pid)
 
 
-def test_default_environ_is_the_process_one(monkeypatch, tmp_path):
-    monkeypatch.setenv("HURI_SERVE_BIN", "from-env")
-    launcher = HuriLauncher(_checkout(tmp_path / "m"), UNREACHABLE)
-    assert launcher.serve_bin == "from-env"
+def test_ray_head_started_by_serve_run_is_stopped(tmp_path):
+    modules = _installed(tmp_path, "exec sleep 30\n", ray_status_code=1)
+
+    async def scenario():
+        launcher = HuriLauncher(modules, UNREACHABLE)
+        await launcher.start("huri.yaml")
+        await launcher.stop()
+        return launcher.logs()
+
+    logs = asyncio.run(scenario())
+    assert (tmp_path / "ray.log").read_text().splitlines() == ["status", "stop"]
+    assert any("ray stop" in line for line in logs)
+
+
+def test_ray_head_up_before_start_is_left_running(tmp_path):
+    modules = _installed(tmp_path, "exec sleep 30\n", ray_status_code=0)
+
+    async def scenario():
+        launcher = HuriLauncher(modules, UNREACHABLE)
+        await launcher.start("huri.yaml")
+        await launcher.stop()
+        return launcher.logs()
+
+    logs = asyncio.run(scenario())
+    assert (tmp_path / "ray.log").read_text().splitlines() == ["status"]
+    assert any("leaving the Ray head running" in line for line in logs)
+
+
+def test_stop_when_nothing_runs(tmp_path):
+    launcher = HuriLauncher(_checkout(tmp_path / "huri-modules"), UNREACHABLE)
+    with pytest.raises(NotRunningError):
+        asyncio.run(launcher.stop())
+    asyncio.run(launcher.shutdown())  # backend shutdown: nothing to stop
+
+
+def test_shutdown_stops_the_owned_process(tmp_path):
+    modules = _installed(tmp_path, "exec sleep 30\n")
+
+    async def scenario():
+        launcher = HuriLauncher(modules, UNREACHABLE)
+        await launcher.start("huri.yaml")
+        proc = launcher._process
+        await launcher.shutdown()
+        return proc.returncode, await launcher.status()
+
+    returncode, status = asyncio.run(scenario())
+    assert returncode is not None
+    assert status["status"] == "stopped"
+
+
+def test_crash_appends_the_status_report(tmp_path):
+    modules = _installed(tmp_path, 'echo "boom"\nexit 3\n')
+    (modules / ".huri-local" / "status.sh").write_text('echo "qdrant: down"\n')
+
+    async def scenario():
+        launcher = HuriLauncher(modules, UNREACHABLE)
+        await launcher.start("huri.yaml")
+        await _wait_for(lambda: any("[status.sh]" in line for line in launcher.logs()))
+        return await launcher.status(), launcher.logs()
+
+    status, logs = asyncio.run(scenario())
+    assert status["status"] == "crashed" and status["exit_code"] == 3
+    assert any(line.endswith("[status.sh] qdrant: down") for line in logs)

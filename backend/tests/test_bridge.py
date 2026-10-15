@@ -1,4 +1,4 @@
-"""The browser <-> HuRI bridge: name mapping, handshake, and whole sessions
+"""The browser <-> HuRI bridge: handshake, subscriptions, and whole sessions
 through main.app against a fake HuRI server (fake_huri.py)."""
 
 import asyncio
@@ -7,48 +7,20 @@ import json
 
 import numpy as np
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 from huri_events import Audio, Emotion, Motion, RAGQuestion, Token, Transcript
 
 import huri_bridge
 import main
-from fake_huri import OUTPUTS
+from fake_huri import INPUTS, OUTPUTS
 from huri_bridge import (
     InvalidHandshake,
-    browser_module_names,
     build_session_modules,
     describe_config,
     subscriptions,
-    to_browser_name,
-    to_server_name,
 )
 from huri_presets import load_presets
-
-# --- names ----------------------------------------------------------------------
-
-
-def test_legacy_names_map_to_curated_modules():
-    assert to_server_name("mic") == "vad"
-    assert to_server_name("gesture") == "mov"
-    for name in ("stt", "tag", "emo", "eag", "qag", "rag", "vad", "mov"):
-        assert to_server_name(name) == name
-
-
-def test_tts_resolves_to_the_engine_the_server_runs():
-    assert to_server_name("tts") == "tts"
-    assert to_server_name("tts", ["tts", "tts_cosyvoice"]) == "tts"
-    assert to_server_name("tts", ["rag", "tts_cosyvoice"]) == "tts_cosyvoice"
-    # Unknown to the server either way: its session_error says so.
-    assert to_server_name("tts", ["rag"]) == "tts"
-    assert to_server_name("tts_cosyvoice", ["tts"]) == "tts_cosyvoice"
-
-
-def test_server_modules_in_browser_names():
-    assert to_browser_name("vad") == "mic"
-    assert browser_module_names(
-        ["eag", "emo", "mov", "qag", "rag", "stt", "tag", "tts", "tts_cosyvoice", "vad"]
-    ) == ["eag", "emo", "gesture", "mic", "qag", "rag", "stt", "tag", "tts"]
-
 
 @pytest.mark.parametrize(
     "handshake",
@@ -72,12 +44,11 @@ def test_handshake_to_session_modules():
     modules = build_session_modules(
         {
             "modules": {
-                "mic": {"name": "mic", "args": {"vad_agressiveness": 2}},
-                "tts": {"name": "tts"},
+                "mic": {"name": "vad", "args": {"vad_agressiveness": 2}},
+                "tts": {"name": "tts_cosyvoice"},
                 "servo": {"module": "my_pkg.servo:Servo"},
             }
-        },
-        ["vad", "tts_cosyvoice"],
+        }
     )
     assert modules == {
         "mic": {"name": "vad", "args": {"vad_agressiveness": 2}},
@@ -86,31 +57,31 @@ def test_handshake_to_session_modules():
     }
 
 
-def test_subscriptions_follow_the_producers():
+DETAILS = {name: {"input": INPUTS[name], "output": out} for name, out in OUTPUTS.items()}
+
+
+def test_subscriptions_follow_the_server_details():
     modules = {
         "a": {"name": "vad"},
         "b": {"name": "emo"},
         "c": {"name": "qag"},
         "d": {"name": "tts_cosyvoice"},
         "e": {"name": "mov"},
+        "f": {"module": "my_pkg.servo:Servo"},
     }
-    assert subscriptions(modules) == ["huri.audio.out", "huri.motion", "huri.question"]
-    assert subscriptions({"r": {"name": "rag"}}) == ["huri.token"]
+    assert subscriptions(modules, DETAILS) == [
+        "huri.audio.out",
+        "huri.motion",
+        "huri.question",
+    ]
+    assert subscriptions({"r": {"name": "rag"}}, DETAILS) == ["huri.token"]
+    # A module the server does not describe contributes nothing.
+    assert subscriptions({"r": {"name": "rag"}}, {}) == []
 
 
-def test_session_config_speaks_the_frontend_names():
-    config = describe_config(
-        {"m": {"name": "vad", "args": {}}, "g": {"name": "mov", "args": {}}}
-    )
-    assert config["modules"] == {
-        "m": {"name": "mic", "args": {}},
-        "g": {"name": "gesture", "args": {}},
-    }
-    assert config["huri_modules"]["g"]["name"] == "mov"
-    assert config["hooks"] == {
-        "motion": {"name": "web_motion", "topics": ["huri.motion"], "args": {}}
-    }
-    assert set(config["senders"]) == {"audio", "text", "token"}
+def test_session_config_echoes_the_modules():
+    modules = {"m": {"name": "vad", "args": {}}, "g": {"name": "mov", "args": {}}}
+    assert describe_config(modules) == {"modules": modules}
 
 
 # --- sessions through main.app -----------------------------------------------------
@@ -195,21 +166,20 @@ def test_voice_session_with_speech_and_avatar(huri_env):
 
     huri_env.on_frame = reply
     browser_modules = {
-        "mic": {"name": "mic", "args": {"block_duration": 0.03}},
+        "mic": {"name": "vad", "args": {"block_duration": 0.03}},
         "stt": {"name": "stt", "args": {}},
         "tag": {"name": "tag", "args": {}},
         "emo": {"name": "emo", "args": {}},
         "eag": {"name": "eag", "args": {}},
         "qag": {"name": "qag", "args": {}},
         "rag": {"name": "rag", "args": {}},
-        "tts": {"name": "tts", "args": {}},
-        "gesture": {"name": "gesture", "args": {}},
+        "tts": {"name": "tts_cosyvoice", "args": {}},
+        "gesture": {"name": "mov", "args": {}},
     }
     with TestClient(main.app) as client:
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"modules": browser_modules})
             config = ws.receive_json()["config"]
-            # The frontend keys its mic button / avatar on these names.
             assert config["modules"] == browser_modules
             ws.send_bytes(b"\x01\x00\x02\x00")
             received = {}
@@ -217,10 +187,7 @@ def test_voice_session_with_speech_and_avatar(huri_env):
                 msg = ws.receive_json()
                 received[msg["type"]] = msg
 
-    sent = huri_env.handshakes[0]["modules"]
-    assert sent["mic"]["name"] == "vad"
-    assert sent["gesture"]["name"] == "mov"
-    assert sent["tts"]["name"] == "tts_cosyvoice"
+    assert huri_env.handshakes[0]["modules"] == browser_modules
     assert huri_env.handshakes[0]["subscribe"] == [
         "huri.audio.out",
         "huri.motion",
@@ -247,16 +214,13 @@ def test_voice_session_with_speech_and_avatar(huri_env):
     assert set(segment["frames"][0]["rotations"]) >= {"pelvis", "jaw", "right_thumb3"}
 
 
-PRESETS = load_presets(main.PRESETS_DIR)
-COSYVOICE_ONLY = sorted(set(OUTPUTS) - {"tts"})
+PRESETS = load_presets()
 
 
-@pytest.mark.parametrize("server", [sorted(OUTPUTS), COSYVOICE_ONLY], ids=["all", "cosyvoice"])
 @pytest.mark.parametrize("key", sorted(PRESETS))
-def test_every_client_preset_opens_a_session(huri_env, key, server):
+def test_every_client_preset_opens_a_session(huri_env, key):
     """Each presets/F*/*.json handshake passes the fake's copy of huri-core's
     session wiring check, so the bridge sends and subscribes what it needs."""
-    huri_env.modules = server
     with TestClient(main.app) as client:
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"modules": PRESETS[key]})
@@ -273,60 +237,102 @@ def test_a_session_missing_its_input_is_refused(huri_env, monkeypatch):
             ws.send_json({"modules": PRESETS["F7/text_to_voice"]})
             reply = ws.receive_json()
     assert reply["type"] == "error"
-    assert "no producer for ['tts']" in reply["message"]
+    assert "no producer for ['tts_cosyvoice']" in reply["message"]
 
 
-def test_tts_is_remapped_when_the_module_list_is_unknown(huri_env, monkeypatch):
-    """GET /modules failed: the browser's "tts" reaches a CosyVoice-only
-    server unmapped, is refused, and the bridge retries with the server's
-    module list."""
-    huri_env.modules = COSYVOICE_ONLY
-
-    async def unknown():
-        return None
-
-    monkeypatch.setattr(main, "_server_module_names", unknown)
-    with TestClient(main.app) as client:
-        with client.websocket_connect("/ws") as ws:
-            ws.send_json({"modules": {"tts": {"name": "tts", "args": {}}}})
-            reply = ws.receive_json()
-    assert reply["type"] == "session_config"
-    assert reply["config"]["huri_modules"]["tts"]["name"] == "tts_cosyvoice"
-    assert [h["modules"]["tts"]["name"] for h in huri_env.handshakes] == [
-        "tts",
-        "tts_cosyvoice",
-    ]
-
-
-def test_module_list_is_cached_and_survives_a_failed_fetch(huri_env, monkeypatch):
+def test_module_details_are_cached_and_survive_a_failed_fetch(monkeypatch):
     calls = []
+    details = {"rag": {"input": "huri.question", "output": "huri.token"}}
 
     async def fetch():
         calls.append(1)
         if len(calls) > 1:
             raise OSError("HuRI is slow")
-        return {"modules": ["rag", "tts_cosyvoice"]}
+        return {"modules": ["rag"], "details": details}
 
     monkeypatch.setattr(main, "_fetch_server_modules", fetch)
-    monkeypatch.setattr(main, "_MODULE_NAMES_CACHE", {})
+    monkeypatch.setattr(main, "_MODULE_DETAILS_CACHE", {})
 
     async def scenario():
-        first = await main._server_module_names()
-        cached = await main._server_module_names()  # within the TTL: no fetch
-        monkeypatch.setattr(main, "_MODULE_NAMES_TTL", 0.0)
-        after_failure = await main._server_module_names()
+        first = await main._module_details()
+        cached = await main._module_details()  # within the TTL: no fetch
+        monkeypatch.setattr(main, "_MODULE_DETAILS_TTL", 0.0)
+        after_failure = await main._module_details()
         return first, cached, after_failure
 
     first, cached, after_failure = asyncio.run(scenario())
-    assert first == cached == after_failure == ["rag", "tts_cosyvoice"]
+    assert first == cached == after_failure == details
     assert len(calls) == 2
+
+
+def test_module_details_unknown_refuses_the_session(huri_env, monkeypatch):
+    async def unknown():
+        return None
+
+    monkeypatch.setattr(main, "_module_details", unknown)
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"modules": RAG_ONLY})
+            reply = ws.receive_json()
+    assert reply["type"] == "error"
+    assert "GET /modules" in reply["message"]
+    assert huri_env.handshakes == []
+
+
+class _GoneBrowser:
+    """A browser websocket that sends its handshake, then is gone: every
+    send raises WebSocketDisconnect."""
+
+    def __init__(self, handshake):
+        self.handshake = handshake
+        self.closed_with = None
+
+    async def receive_json(self):
+        return self.handshake
+
+    async def receive(self):
+        return {"type": "websocket.disconnect"}
+
+    async def send_json(self, payload):
+        raise WebSocketDisconnect()
+
+    async def close(self, code=1000):
+        self.closed_with = code
+
+
+def test_huri_session_is_closed_when_the_browser_left_before_session_config(
+    huri_env, monkeypatch
+):
+    """The session_config send fails: the HuRI session opened just before is
+    still closed (teardown with no task created yet)."""
+    closed = []
+    real_close = huri_bridge.HuRIClient.close
+
+    async def close(self):
+        closed.append(self)
+        await real_close(self)
+
+    monkeypatch.setattr(huri_bridge.HuRIClient, "close", close)
+
+    async def scenario():
+        with pytest.raises(WebSocketDisconnect):
+            await huri_bridge.run_browser_session(
+                _GoneBrowser({"modules": RAG_ONLY}),
+                user_id="u",
+                huri_url=huri_env.ws_url,
+                module_details=main._module_details,
+            )
+
+    asyncio.run(scenario())
+    assert len(huri_env.handshakes) == 1
+    assert len(closed) == 1
 
 
 def test_refused_session_reaches_the_browser(huri_env):
     huri_env.modules = ["rag"]
     with TestClient(main.app) as client:
         with client.websocket_connect("/ws") as ws:
-            ws.send_json({"modules": {"gesture": {"name": "gesture", "args": {}}}})
+            ws.send_json({"modules": {"gesture": {"name": "mov", "args": {}}}})
             reply = ws.receive_json()
     assert reply["type"] == "error"
     assert "HuRI refused the session" in reply["message"]
@@ -356,12 +362,11 @@ def test_unreachable_huri(monkeypatch):
 # --- HTTP routes ------------------------------------------------------------------------
 
 
-def test_huri_modules_in_frontend_names(huri_env):
+def test_huri_modules_is_the_server_answer(huri_env):
     huri_env.modules = ["mov", "rag", "tts_cosyvoice", "vad"]
     with TestClient(main.app) as client:
         body = client.get("/huri-modules").json()
-    assert body["modules"] == ["gesture", "mic", "rag", "tts"]
-    assert body["server_modules"] == ["mov", "rag", "tts_cosyvoice", "vad"]
+    assert body["modules"] == ["mov", "rag", "tts_cosyvoice", "vad"]
     assert body["details"]["rag"]["output"] == "huri.token"
     assert body["huri_core"] == "0.4.0"
 
@@ -373,10 +378,9 @@ def test_huri_modules_unreachable(monkeypatch):
     assert body["modules"] is None
 
 
-def test_presets_are_served_in_frontend_names():
+def test_presets_are_served_as_written():
     with TestClient(main.app) as client:
         presets = client.get("/presets").json()
-    full = presets["F4/voice_with_speech"]
-    names = {m["name"] for m in full.values()}
-    assert {"mic", "gesture", "tts"} <= names
-    assert not names & {"vad", "mov"}
+    assert presets == load_presets()
+    names = {m["name"] for m in presets["F4/voice_with_speech"].values()}
+    assert {"vad", "mov", "tts_cosyvoice"} <= names

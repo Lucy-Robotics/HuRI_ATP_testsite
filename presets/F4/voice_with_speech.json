@@ -21,6 +21,6 @@
       "max_length": 1024
     }
   },
-  "tts": { "name": "tts", "args": {} },
+  "tts": { "name": "tts_cosyvoice", "args": {} },
   "mov": { "name": "mov", "args": {} }
 }

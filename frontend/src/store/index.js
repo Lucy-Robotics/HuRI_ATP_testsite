@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { resetUtterance, scheduleChunk } from "../audio/playback.js";
+import { TTS_ENGINES } from "../modules.js";
 
 let nextId = 1;
 const newId = () => `m${nextId++}`;
@@ -33,7 +34,7 @@ const useStore = create((set, get) => ({
   // --- connection / session -------------------------------------------
   connectionStatus: "idle", // "idle" | "connecting" | "connected" | "error" | "closed"
   statusMessage: "",
-  sessionConfig: null, // {modules, senders, hooks}, echoed back by the backend
+  sessionConfig: null, // {modules}, echoed back by the backend
   sendTopic: null, // (topic, text) => void, installed by useWebSocket
   sendAudioFrame: null, // (ArrayBuffer) => void
   reconfigure: null, // (modules) => void — re-handshakes with a new module set
@@ -45,13 +46,16 @@ const useStore = create((set, get) => ({
   setSendAudioFrame: (fn) => set({ sendAudioFrame: fn }),
   setReconfigure: (fn) => set({ reconfigure: fn }),
 
-  /** Whether a module is part of the currently active session — drives
-   * conditional rendering (no mic button without "mic", no avatar panel
-   * without "gesture", etc). */
+  /** Whether a module (by its HuRI name) is part of the active session —
+   * drives conditional rendering (no mic button without "vad", no avatar
+   * panel without "mov", etc). */
   hasModule: (name) => {
     const modules = get().sessionConfig?.modules || {};
     return Object.values(modules).some((m) => m.name === name);
   },
+
+  /** Whether the session speaks, with either TTS engine. */
+  hasTTS: () => TTS_ENGINES.some((name) => get().hasModule(name)),
 
   // --- avatar ------------------------------------------------------------
   frames: [],
@@ -70,10 +74,9 @@ const useStore = create((set, get) => ({
    * expects to see come back on the "question" hook.
    *
    * HuRI fans a published event out to *every* subscriber of its topic, and
-   * the web_question hook subscribes to the same "question" topic the text
-   * sender publishes on (see HuRI/src/core/bus.py + web_interface.py). So a
-   * typed message is echoed straight back to us alongside being handed to
-   * RAG — without this, `onQuestion` would open a second turn for a message
+   * with qag in the session the bridge subscribes to huri.question, the
+   * topic a typed question is sent on (backend/huri_bridge.py). So a typed
+   * message is echoed straight back to us alongside being handed to RAG — without this, `onQuestion` would open a second turn for a message
    * `submitText` already rendered, duplicating the user bubble and leaving
    * the first assistant bubble pending forever. Entries are {id, text}, FIFO. */
   _sentQuestions: [],
@@ -190,7 +193,7 @@ const useStore = create((set, get) => ({
     });
     // No TTS in this session: the token stream is the whole reply, so its end
     // marker is what closes the turn (otherwise the "audio" end marker does).
-    if (end && !get().hasModule("tts")) get()._completeLastAssistant();
+    if (end && !get().hasTTS()) get()._completeLastAssistant();
   },
 
   /** "audio" hook message: one TTS chunk. */

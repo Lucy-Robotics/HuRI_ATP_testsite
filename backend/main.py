@@ -1,35 +1,21 @@
 """
-Backend bridge between the browser frontend and a HuRI server.
+Backend between the browser frontend and a HuRI server.
 
-The HuRI session itself goes through huri-core's client SDK
-(``huri_core.core.client.HuRIClient``, installed with ``huri-core[client]``
-and the curated events of ``huri-events``, see requirements.txt), driven by
-``huri_bridge.py``. This file owns everything that is specific to *this
+The HuRI session goes through huri-core's client SDK (``HuRIClient``, from
+``huri-core[client]``) and the curated events of ``huri-events`` (see
+requirements.txt), driven by ``huri_bridge.py``, which also documents the
+browser protocol on ``/ws``. This file owns what is specific to *this
 website*: Authelia/magic-link auth, CORS, serving the built SPA, the
-module-combination presets, the HuRI launcher, and reshaping gesture output for
-this frontend's 3D rig.
-
-Frontend <-> backend protocol on ``/ws`` (unchanged by the move to the SDK):
-
-  1. the frontend sends one handshake: ``{"modules": {tag: {name, args}}}``
-     (see the repo-root ``presets/`` folder, loaded by ``huri_presets.py``,
-     for ready-made combinations);
-  2. the backend replies ``{"type": "session_config", "config": {...}}``;
-  3. inbound: binary frames are mic PCM (always ``huri.audio.in``); JSON
-     frames are ``{"topic": "question"|"token", "text": ...}`` — the
-     frontend's event dropdown picks which one a given typed message targets
-     ("rag.in" vs "rag.out" in HuRI/ATP.xlsx's terms);
-  4. outbound: ``{"type": "token"|"audio"|"segment"|"question"|"error", ...}``,
-     where a ``"segment"`` message carries HuRI's raw pose/expression/
-     translation arrays already converted into this frontend's ``{t,
-     rotations, blendshapes, positions}`` frame format by ``pipeline.py``.
+module-combination presets, the HuRI launcher, and reshaping gesture output
+for this frontend's 3D rig (``pipeline.py``).
 """
 
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -39,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
-from huri_bridge import browser_module_names, run_browser_session
+from huri_bridge import ModuleDetails, run_browser_session
 from huri_launcher import (
     AlreadyRunningError,
     HuriLauncher,
@@ -47,7 +33,7 @@ from huri_launcher import (
     UnknownConfigError,
     resolve_modules_path,
 )
-from huri_presets import PRESETS_DIR, load_presets
+from huri_presets import load_presets
 from pipeline import motion_arrays_to_frames
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -141,7 +127,14 @@ elif REQUIRE_AUTH:
         "will be rejected. Set OIDC_ISSUER or REQUIRE_AUTH=0."
     )
 
-app = FastAPI(title="HuRI Website")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    yield
+    # A HuRI this backend started must not outlive it (Ctrl-C, reload, ...).
+    await _launcher.shutdown()
+
+
+app = FastAPI(title="HuRI Website", lifespan=_lifespan)
 
 # SessionMiddleware backs the signed cookie that carries the OIDC `sub`; it is
 # read on both the HTTP auth routes and the /ws handshake.
@@ -265,9 +258,8 @@ async def presets() -> Dict[str, Any]:
     without a server restart. Read fresh from the repo-root ``presets/``
     folder on every call (see huri_presets.py), so a preset file added,
     edited, or removed there shows up on the next request with no backend
-    restart. The files use huri-modules' module names (``vad``, ``mov``);
-    they are served in the frontend's (``mic``, ``gesture``)."""
-    return load_presets(browser_names=True)
+    restart. The files use huri-modules' module names (``vad``, ``mov``...)."""
+    return load_presets()
 
 
 def _huri_ws_url() -> str:
@@ -283,40 +275,36 @@ def _huri_http_base() -> str:
 
 
 async def _fetch_server_modules() -> Dict[str, Any]:
-    """HuRI's ``GET /modules``: ``{"modules": [...], "details": {...},
-    "huri_core": "..."}`` (huri-core >= 0.4; older servers only give
-    ``modules``)."""
+    """HuRI's ``GET /modules``: ``{"modules": [...], "details": {name:
+    {"input", "output", "actuation"}}, "huri_core": "..."}``."""
     async with httpx.AsyncClient(timeout=3.0) as client:
         resp = await client.get(f"{_huri_http_base()}/modules")
         resp.raise_for_status()
         return resp.json()
 
 
-# HuRI origin -> (fetched_at, module names): the last good GET /modules answer.
-_MODULE_NAMES_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+# HuRI origin -> (fetched_at, details): the last good GET /modules answer.
+_MODULE_DETAILS_CACHE: Dict[str, Tuple[float, ModuleDetails]] = {}
 # Sessions opened within this window reuse the last answer without asking.
-_MODULE_NAMES_TTL = 5.0
+_MODULE_DETAILS_TTL = 5.0
 
 
-async def _server_module_names() -> Optional[List[str]]:
-    """The modules the HuRI server enabled (it picks the TTS engine the
-    browser's ``tts`` means), or None when it was never reachable.
-
-    Asked at most every few seconds rather than on every connect, and a
-    failed ask reuses the last good answer: one slow ``/modules`` must not
-    leave ``tts`` unmapped against a CosyVoice-only server. (The bridge also
-    retries a refused session once with the server's own module list.)"""
+async def _module_details() -> Optional[ModuleDetails]:
+    """The ``details`` of HuRI's ``GET /modules`` (each module's input and
+    output topic), or None when it was never reachable. Asked at most every
+    few seconds rather than on every connect; a failed ask reuses the last
+    good answer."""
     base = _huri_http_base()
-    cached = _MODULE_NAMES_CACHE.get(base)
-    if cached is not None and time.monotonic() - cached[0] < _MODULE_NAMES_TTL:
-        return list(cached[1])
+    cached = _MODULE_DETAILS_CACHE.get(base)
+    if cached is not None and time.monotonic() - cached[0] < _MODULE_DETAILS_TTL:
+        return cached[1]
     try:
-        names = list((await _fetch_server_modules()).get("modules") or [])
+        details = dict((await _fetch_server_modules()).get("details") or {})
     except Exception as e:
         logger.info("Could not list HuRI's modules: %s", e)
-        return list(cached[1]) if cached is not None else None
-    _MODULE_NAMES_CACHE[base] = (time.monotonic(), names)
-    return names
+        return cached[1] if cached is not None else None
+    _MODULE_DETAILS_CACHE[base] = (time.monotonic(), details)
+    return details
 
 
 async def _require_auth(request: Request) -> str:
@@ -337,7 +325,6 @@ async def _require_auth(request: Request) -> str:
 _launcher = HuriLauncher(
     resolve_modules_path(os.environ, _REPO_ROOT),
     probe_url=_huri_http_base(),
-    presets_dir=PRESETS_DIR,
 )
 
 
@@ -347,11 +334,13 @@ class _LauncherStartRequest(BaseModel):
 
 @app.get("/launcher/huri/configs")
 async def launcher_configs(_sub: str = Depends(_require_auth)) -> Dict[str, Any]:
-    """Server-side HuRI configs (huri-modules' config/huri*.yaml, and the
-    presets/F*/huri*.yaml copies) that can be launched — as opposed to the
-    client_*.yaml configs, which are for a client connecting to an
-    already-running HuRI, not for launching one."""
-    return {"configs": _launcher.list_configs()}
+    """huri-modules' launchable Serve configs (config/huri*.yaml, including
+    the installer's huri_local.generated.yaml)."""
+    return {
+        "configs": _launcher.list_configs(),
+        # Why Start cannot work here (no checkout, not installed), or None.
+        "install_problem": _launcher.install_problem(),
+    }
 
 
 @app.get("/launcher/huri/status")
@@ -390,30 +379,20 @@ async def launcher_stop(_sub: str = Depends(_require_auth)) -> Dict[str, Any]:
 
 @app.get("/huri-modules")
 async def huri_modules() -> Dict[str, Any]:
-    """Which modules the connected HuRI instance actually has deployed
-    (huri-core's ``GET /modules``) — lets the Event Configuration modal
-    disable module combinations that would otherwise only fail once a tester
-    hits Apply (e.g. "tts"/"gesture" on a machine with no GPU, per
-    huri-modules' install.sh device plan).
+    """HuRI's ``GET /modules`` as is (``modules``, ``details``,
+    ``huri_core``): the Event Configuration modal lists these modules, so a
+    combination the instance cannot serve is not offered.
 
-    ``modules`` is in the frontend's names (``vad`` -> ``mic``, ``mov`` ->
-    ``gesture``, either TTS engine -> ``tts``); ``server_modules``,
-    ``details`` and ``huri_core`` are HuRI's answer as is.
-
-    ``modules: null`` means HuRI couldn't be reached at all (distinct from an
-    empty list, which would mean it's up but has nothing registered) — the
-    frontend should let everything through rather than lock the UI when it
-    can't tell what's actually available.
+    ``modules: null`` means HuRI could not be reached (distinct from an empty
+    list: up, with nothing enabled); the frontend then blocks nothing.
     """
     try:
         info = await _fetch_server_modules()
     except Exception as e:
         logger.warning("Could not reach HuRI at %s/modules: %s", _huri_http_base(), e)
         return {"modules": None, "error": str(e)}
-    server_modules = list(info.get("modules") or [])
     return {
-        "modules": browser_module_names(server_modules),
-        "server_modules": server_modules,
+        "modules": list(info.get("modules") or []),
         "details": info.get("details", {}),
         "huri_core": info.get("huri_core"),
     }
@@ -462,7 +441,7 @@ async def websocket_endpoint(ws: WebSocket):
             ws,
             user_id=user_id,
             huri_url=_huri_ws_url(),
-            server_modules=_server_module_names,
+            module_details=_module_details,
             transform_outbound=_transform_outbound,
         )
     except WebSocketDisconnect:

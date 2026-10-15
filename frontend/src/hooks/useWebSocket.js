@@ -15,18 +15,9 @@ function decodeAudio(b64) {
 }
 
 /**
- * Owns the single websocket to the backend, speaking the protocol
- * HuRI/src/interfaces/web_interface.py + backend/main.py implement:
- *
- *   -> {"modules": {tag: {name, args}}}              handshake, once
- *   <- {"type": "session_config", "config": {...}}    resolved config echo
- *   -> {"topic": "question"|"token", "text": ...}     typed input (event picker)
- *   -> <binary ArrayBuffer>                            mic PCM frames
- *   <- {"type": "token"|"audio"|"segment"|"question"|"error", ...}
- *
- * "question" already carries the linked emotion (RAGQuestion.emotion, the
- * aggregated per-utterance read) — that's the only source of emotion data on
- * the wire, there's no separate raw "emotion" stream to listen for.
+ * Owns the single websocket to the backend. The protocol (handshake,
+ * session_config, inbound frames, outbound message types) is documented in
+ * backend/huri_bridge.py.
  *
  * `initialModules` seeds the first handshake; calling the store's
  * `reconfigure(modules)` (wired up here) tears down the connection and opens
@@ -100,9 +91,8 @@ export function useWebSocket(initialModules, { enabled = true } = {}) {
           onToken(msg);
           break;
         case "audio":
-          // The wire field is snake_case (web_interface.py's WebAudioHook);
-          // without this mapping createBuffer() gets an undefined rate and
-          // throws, so every chunk is silently dropped.
+          // The wire field is snake_case; without this mapping
+          // createBuffer() gets an undefined rate and every chunk is dropped.
           onAudio({
             ...msg,
             data: decodeAudio(msg.data),

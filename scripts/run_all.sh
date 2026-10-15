@@ -15,8 +15,8 @@ pids=()
 cleanup() {
   echo
   echo "==> Shutting down..."
-  # Ask the backend's launcher to stop HuRI cleanly (SIGINT to `serve run`,
-  # then `ray stop`) before anything gets killed out from under it.
+  # Ask the backend's launcher to stop a HuRI it started while the backend is
+  # still up: killing run_backend.sh below may not reach uvicorn's shutdown.
   curl -fsS -X POST "$BACKEND_URL/launcher/huri/stop" >/dev/null 2>&1 || true
   for pid in "${pids[@]:-}"; do
     kill "$pid" 2>/dev/null || true

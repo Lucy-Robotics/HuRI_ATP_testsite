@@ -1,11 +1,10 @@
-"""The presets/ tree: client presets name curated modules, and every server
-config is one huri-core can serve."""
+"""The presets/ tree: client presets name curated modules, and the copies
+that the ATP sheet points at from several feature folders stay identical."""
 
 import tomllib
 from pathlib import Path
 
 import pytest
-import yaml
 
 from fake_huri import INPUTS, OUTPUTS
 from huri_presets import load_presets
@@ -13,26 +12,15 @@ from huri_presets import load_presets
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PRESETS = REPO_ROOT / "presets"
 MANIFESTS = sorted((REPO_ROOT / "huri-modules" / "packages").glob("*/*/**/huri_module.toml"))
-SERVER_CONFIGS = sorted(PRESETS.rglob("huri*.yaml"))
 
-# Deployment name of each module's Serve deployment (huri-modules' *Handle
-# classes); modules without a shared actor have none.
-HANDLE_BY_MODULE = {
-    "stt": "STTHandle",
-    "emo": "EMOHandle",
-    "rag": "RAGHandle",
-    "tts": "TTSHandle",
-    "tts_cosyvoice": "CosyVoiceTTSHandle",
-    "mov": "MOVHandle",
-}
-
-
-def test_every_feature_folder_is_there():
-    folders = sorted(p.name for p in PRESETS.iterdir() if p.is_dir())
-    assert folders == sorted(f"F{i}" for i in range(1, 12))
-    for folder in folders:
-        assert (PRESETS / folder / "huri.yaml").is_file()
-    assert (PRESETS / "F1" / "huri_cpu.yaml").is_file()
+# Each ATP feature folder holds the preset its sheet row points at, so a
+# preset shared by several features exists once per folder. They must not
+# drift apart.
+SHARED_COPIES = [
+    ("F2/full_preset.json", "F4/voice_with_speech.json"),
+    ("F2/rag_only.json", "F9/rag_only.json"),
+    ("F5/voice_to_question.json", "F6/voice_to_question.json"),
+]
 
 
 def test_client_presets_use_curated_module_names():
@@ -46,27 +34,24 @@ def test_client_presets_use_curated_module_names():
             assert isinstance(entry.get("args", {}), dict)
 
 
-def test_presets_load_in_browser_names():
-    presets = load_presets(PRESETS, browser_names=True)
-    assert presets["F8/text_to_avatar"] == {
-        "tts": {"name": "tts", "args": {}},
-        "mov": {"name": "gesture", "args": {}},
-    }
-    assert presets["F5/voice_to_question"]["vad"]["name"] == "mic"
+def test_presets_hold_no_server_configs():
+    """Server configs are huri-modules' config/huri*.yaml, never copies here."""
+    assert not list(PRESETS.rglob("*.yaml"))
 
 
-@pytest.mark.parametrize("path", SERVER_CONFIGS, ids=lambda p: str(p.relative_to(PRESETS)))
-def test_server_configs_run_huri_core(path):
-    config = yaml.safe_load(path.read_text())
-    (app,) = config["applications"]
-    assert app["import_path"] == "huri_core.app:app"
-    env = app["runtime_env"]["env_vars"]
-    enabled = [m.strip() for m in env["HURI_MODULES"].split(",")]
-    assert set(enabled) <= set(OUTPUTS)
-    deployments = {d["name"] for d in app["deployments"]}
-    expected = {"HuRI"} | {HANDLE_BY_MODULE[m] for m in enabled if m in HANDLE_BY_MODULE}
-    assert deployments == expected
+@pytest.mark.parametrize("first,second", SHARED_COPIES)
+def test_shared_presets_are_identical(first, second):
+    assert (PRESETS / first).read_bytes() == (PRESETS / second).read_bytes()
 
+
+def test_invalid_files_are_skipped(tmp_path):
+    (tmp_path / "ok.json").write_text('{"rag": {"name": "rag"}}')
+    (tmp_path / "list.json").write_text("[]")
+    (tmp_path / "broken.json").write_text("{")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "deep.json").write_text("{}")
+    assert load_presets(tmp_path) == {"ok": {"rag": {"name": "rag"}}, "sub/deep": {}}
+    assert load_presets(tmp_path / "missing") == {}
 
 
 @pytest.mark.skipif(not MANIFESTS, reason="huri-modules submodule not checked out")

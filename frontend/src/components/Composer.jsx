@@ -22,6 +22,7 @@ export default function Composer({ onOpenSettings }) {
   const [level, setLevel] = useState(0);
 
   const hasModule = useStore((s) => s.hasModule);
+  const hasTTS = useStore((s) => s.hasTTS);
   const sendTopic = useStore((s) => s.sendTopic);
   const sendAudioFrame = useStore((s) => s.sendAudioFrame);
   const pushMicFrame = useStore((s) => s.pushMicFrame);
@@ -32,9 +33,9 @@ export default function Composer({ onOpenSettings }) {
   const recording = useStore((s) => s.recording);
   const connected = useStore((s) => s.connectionStatus === "connected");
 
-  const canAudio = hasModule("mic");
+  const canAudio = hasModule("vad");
   const canQuestion = hasModule("rag");
-  const canToken = hasModule("tts");
+  const canToken = hasTTS();
 
   const options = useMemo(() => {
     const opts = [];
