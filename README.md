@@ -176,7 +176,9 @@ rather than fall back to a public default, since it's what makes the session coo
   release, now in progress: until they are pushed, `pip install -r backend/requirements.txt`
   fails to resolve them; install both editable from local checkouts instead
   (`.venv/bin/pip install -e '<huri-core>[client]' -e <huri-modules>/packages/huri-events`,
-  then the rest of the file). The `huri-modules` submodule likewise pins a `dev` commit until
+  then the rest of the file), and start the scripts with `SKIP_PIP_INSTALL=1`
+  (`SKIP_PIP_INSTALL=1 ./scripts/run_all.sh` or `./scripts/run_backend.sh`): otherwise their
+  `pip install -r requirements.txt` fails on the missing tags and stops them. The `huri-modules` submodule likewise pins a `dev` commit until
   the `0.1.0` tag exists, and must then be moved to it (`git -C huri-modules checkout 0.1.0`,
   commit the gitlink).
 - The Control Panel runs `serve run` with huri-modules' `.huri-local/env.sh`, not the full

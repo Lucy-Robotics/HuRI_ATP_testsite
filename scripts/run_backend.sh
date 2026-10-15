@@ -14,7 +14,11 @@ if [ ! -d "$VENV" ]; then
   python3 -m venv "$VENV"
 fi
 source "$VENV/bin/activate"
-pip install -q -r requirements.txt
+# SKIP_PIP_INSTALL=1 keeps the venv as is, e.g. with huri-core / huri-events
+# installed editable from local checkouts before their pinned tags exist.
+if [ "${SKIP_PIP_INSTALL:-0}" != 1 ]; then
+  pip install -q -r requirements.txt
+fi
 
 # The HuRI Control Panel (huri_launcher.py) finds the huri-modules checkout
 # itself (HURI_MODULES_PATH, else the huri-modules/ submodule, else a sibling

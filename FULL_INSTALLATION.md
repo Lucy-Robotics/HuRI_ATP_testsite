@@ -587,7 +587,9 @@ python3 -m venv .venv
 releases (huri-core `0.4.0`, huri-events from huri-modules `0.1.0`); no Ray, no torch. Those
 tags come with the release now in progress: until they exist, install both editable from local
 checkouts first (`.venv/bin/pip install -e '<huri-core>[client]' -e
-<huri-modules>/packages/huri-events`). This venv is deliberately separate from
+<huri-modules>/packages/huri-events`, then the rest of the file), and run the scripts with
+`SKIP_PIP_INSTALL=1 ./scripts/run_all.sh` (or `run_backend.sh`): without it their
+`pip install -r requirements.txt` fails on the missing tags and stops them. This venv is deliberately separate from
 `huri-modules/.venv`: the backend only talks to HuRI over its websocket, and runs `serve`/`ray`
 through huri-modules' `.huri-local/env.sh`.
 
@@ -653,10 +655,16 @@ depend on it) and does only part of what `start.sh` does:
 |---|---|
 | Source `env.sh` (venv, `huri.env`, `secrets.env`) | Yes. |
 | Start Qdrant (container or binary) and Ollama | **No: they are the operator's job.** Running `start.sh` once (then `stop.sh` without `--all`) leaves both up for the panel. Without Qdrant RAG returns nothing; `status.sh`'s report in the log tail says which one is down. |
-| GPU environment (`HIP_VISIBLE_DEVICES`, `HSA_OVERRIDE_GFX_VERSION`) | Yes: `env.sh` exports it. |
+| GPU environment (`HIP_VISIBLE_DEVICES`, `HSA_OVERRIDE_GFX_VERSION`) | Yes: `env.sh` exports it (from huri-modules `0.1.0` on; see the note below). |
 | `ray start --head --num-cpus=… --num-gpus=…` | **No.** `serve run` autostarts a Ray head sized to the whole machine (every CPU and GPU), not to the installer's `HURI_RAY_GPUS`. To size it, start the head yourself (`source .huri-local/env.sh && ray start --head --num-gpus=N`) before **Start**: `serve run` joins it, and the panel's Stop then leaves it running. Stop runs `ray stop` only when no Ray head was up before Start. |
 
 The dropdown lists every `config/huri*.yaml` of the huri-modules checkout:
+
+> **With the huri-modules commit this repo currently pins**, `huri.yaml` and `huri_cpu.yaml`
+> do not run as described below yet: they still carry a developer's `PYTHONPATH`, Helm-only
+> `/models` paths and stale RAG keys, and `env.sh` does not export `HIP_VISIBLE_DEVICES` /
+> `HSA_OVERRIDE_GFX_VERSION`. Those runtime fixes come with huri-modules `0.1.0`; until the
+> submodule moves to it, use `huri_local.generated.yaml`.
 
 | Entry | Use it? |
 |---|---|
@@ -706,8 +714,9 @@ Panel (or `huri-modules/.huri-local/start.sh`, which also starts local Qdrant an
 `huri-modules/.huri-local/status.sh` shows every dependency in one screen.
 
 **Stop.** The panel's Stop, and the backend's own shutdown (Ctrl-C in `run_all.sh`), send
-SIGINT to the `serve run` process group (SIGKILL after 20 s), then `ray stop` only if that run
-started the Ray head. A stack started with `start.sh` is stopped with `stop.sh` (`--all` also
+SIGINT to the `serve run` process group (SIGKILL to whatever is left of it after 20 s), then
+`ray stop` only if that run started the Ray head; a Start clicked meanwhile waits for all of it.
+After a crash the panel does the same cleanup on its own. A stack started with `start.sh` is stopped with `stop.sh` (`--all` also
 stops the local Qdrant container and `ollama serve`).
 
 **Update.**
