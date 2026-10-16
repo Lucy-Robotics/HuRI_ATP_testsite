@@ -7,7 +7,7 @@ from the ATP test site. It covers, in order:
 1. [What gets installed](#1-what-gets-installed) and how the pieces talk to each other
 2. [Requirements](#2-requirements)
 3. [Getting the code](#3-get-the-code)
-4. [Installing HuRI](#4-install-huri) with `scripts/install_local.sh`, flag by flag
+4. [Installing HuRI](#4-install-huri) with huri-modules' `install.sh`, flag by flag
 5. [The three external services](#5-the-external-services-in-depth) HuRI depends on — the
    **LLM**, the **embedding model** and **Qdrant** — what they are and how to provide each one
    (local Ollama, a self-hosted OpenAI-compatible server, or a hosted API with a key)
@@ -27,14 +27,14 @@ the LLM, the embedding model and Qdrant run on other machines on the LAN behind 
 HTTPS. The GPU is then free for TTS and gesture generation.
 
 ```bash
-# 1. Code (HuRI is a git submodule; the avatar model is in Git LFS)
+# 1. Code (huri-modules, the HuRI server, is a git submodule; the avatar model is in Git LFS)
 git lfs install
-git clone --recurse-submodules git@github.com:Sentience-Robotics/HuRI_ATP_testsite.git
+git clone --recurse-submodules https://github.com/Lucy-Robotics/HuRI_ATP_testsite.git
 cd HuRI_ATP_testsite
 
-# 2. HuRI — installed *inside* the submodule
-cd HuRI
-./scripts/install_local.sh \
+# 2. HuRI — installed *inside* the huri-modules submodule
+cd huri-modules
+./install.sh \
   --llm-url https://llm.huri.lan --llm-model Qwen3.5-4B-GGUF \
   --embed-url https://embedding.huri.lan --embed-model bge-large-en-v1.5-gguf-Q4_K_M \
   --no-verify-ssl \
@@ -63,18 +63,19 @@ Qdrant container for you.
                   │  /ws  /presets  /launcher/huri/*  /huri-modules
                   ▼
               ATP backend    (FastAPI + uvicorn, :8001)
-                  │  spawns  `serve run <huri config>.yaml`
-                  │  bridges  ws://localhost:8000/session
+                      │  spawns  `serve run <huri config>.yaml`  (from huri-modules/)
+                  │  bridges  ws://localhost:8000/session    (huri-core client SDK)
                   ▼
-              HuRI           (Ray Serve, HTTP/WS :8000 · Ray dashboard :8265)
-               ├─ mic/stt/tag   faster-whisper           local — CPU or GPU
-               ├─ emo/eag       hubert prosody model     local — CPU, per session
+              HuRI           (huri-core on Ray Serve, HTTP/WS :8000 · Ray dashboard :8265)
+               ├─ vad/stt/tag   WebRTC VAD, faster-whisper   local — CPU or GPU
+               ├─ emo/eag       hubert prosody model         local — CPU, per session
                ├─ qag/rag       ──► embeddings   POST {embed_url}/v1/embeddings
                │                ──► LLM          POST {llm_url}/api/chat  (ollama)
                │                                 POST {llm_url}/v1/chat/completions (vllm | api)
                │                ──► Qdrant       vector DB: documents + conversation memory
-               ├─ tts           CosyVoice3-0.5B          local — NVIDIA GPU (or forced CPU)
-               └─ gesture       EMAGE                    local — NVIDIA GPU (or forced CPU)
+               ├─ tts_cosyvoice CosyVoice3-0.5B              local — NVIDIA GPU (or forced CPU)
+               ├─ tts           Piper                        local — CPU (when CosyVoice does not fit)
+               └─ mov           EMAGE gestures               local — NVIDIA GPU (or forced CPU)
 ```
 
 Three processes run on the test machine: the **frontend**, the **backend** and **HuRI**
@@ -93,12 +94,18 @@ elsewhere*.
 | 6333 / 6334 | Qdrant | REST / gRPC — only if Qdrant runs locally |
 | 11434 | Ollama | LLM + embeddings — only if Ollama runs locally |
 
-Two repositories are involved:
+The repositories involved:
 
-- **HuRI** (<https://github.com/Sentience-Robotics/HuRI>) — the conversational pipeline server.
-  Vendored here as the git submodule `HuRI/`.
+- **huri-modules** (<https://github.com/Lucy-Robotics/huri-modules>) — the HuRI server: the
+  curated modules and events, the installer and the Serve configs. Vendored here as the git
+  submodule `huri-modules/`; its installer also installs **huri-core**
+  (<https://github.com/Lucy-Robotics/huri-core>), the framework, at the version it pins.
 - **HuRI_ATP_testsite** (this repo) — the browser test console built to exercise every row of the
-  ATP (acceptance test plan).
+  ATP (acceptance test plan). Its backend is a HuRI client: it installs `huri-core[client]` and
+  `huri-events` (huri-core 0.4.x / huri-modules 0.1.x) and needs no HuRI checkout to run.
+
+The site names modules as the server does (`vad`, `stt`, ..., `tts`/`tts_cosyvoice`, `mov`):
+the Event Configuration modal lists the server's own `GET /modules`.
 
 ---
 
@@ -109,7 +116,7 @@ Two repositories are involved:
 | OS | Linux x86_64 | Ubuntu/Debian, Fedora, Arch, openSUSE are handled by the installer (apt/dnf/pacman/zypper). WSL2 works with an NVIDIA GPU; AMD ROCm does **not** work under WSL2. |
 | Python | **3.12** | HuRI's installer accepts 3.10–3.12 and the ATP backend needs 3.11+; 3.12 is the version that satisfies both, so it is the requirement. Each side builds its own venv. On Arch, install 3.12 via pyenv/uv/AUR and pass `--python` to the installer. |
 | Node.js | 20+ with npm | Frontend only (Vite 5, React 18). Tested with Node 24. |
-| git | any recent | Submodules. |
+| git | any recent | Submodules; the backend installs huri-core and huri-events from git. |
 | Git LFS | installed **before** cloning | The avatar's 3D model (`model.fbx` in `backend/static/` and `frontend/public/`) is an LFS object. Without LFS the clone contains a small text pointer instead, and the avatar never renders. |
 | sudo | for system packages | `build-essential`/gcc, `ffmpeg`, `libsndfile1`, `libportaudio2`, `python3-dev`, `python3.X-venv`. Pass `--skip-system` if you install those yourself. |
 | Container runtime | Docker or Podman — optional | Only for a **local** Qdrant. Without one the installer downloads a standalone Qdrant binary instead. |
@@ -122,7 +129,7 @@ Two repositories are involved:
 | Network | outbound HTTPS | Hugging Face Hub, ModelScope (CosyVoice3 weights), GitHub, PyPI, ollama.com. |
 | Audio (optional) | microphone | Only for the CLI client / mic tests; the browser uses its own mic. |
 
-`./scripts/install_local.sh --plan-only` (run inside `HuRI/`) prints exactly what fits on the
+`./install.sh --plan-only` (run inside `huri-modules/`) prints exactly what fits on the
 current machine without installing anything — run it first on any new box.
 
 ---
@@ -131,11 +138,11 @@ current machine without installing anything — run it first on any new box.
 
 ```bash
 git lfs install          # once per machine, before the clone
-git clone --recurse-submodules git@github.com:Sentience-Robotics/HuRI_ATP_testsite.git
+git clone --recurse-submodules https://github.com/Lucy-Robotics/HuRI_ATP_testsite.git
 cd HuRI_ATP_testsite
 ```
 
-Already cloned without submodules? The `HuRI/` folder is then empty:
+Already cloned without submodules? The `huri-modules/` folder is then empty:
 
 ```bash
 git submodule update --init
@@ -147,23 +154,28 @@ Cloned before installing Git LFS? The `model.fbx` files are pointers; fetch the 
 git lfs install && git lfs pull
 ```
 
-The submodule is pinned to a specific HuRI commit (see `git submodule status`). To move it to
-the commit the ATP site expects after a `git pull`, run `git submodule update` again; to move it
-to the latest upstream commit, `git submodule update --remote HuRI` (then re-run the HuRI
-installer stages that changed, see [§7](#7-operating-it)).
+The submodule is pinned to a specific huri-modules commit (see `git submodule status`): a
+huri-modules 0.1.x release, compatible with the huri-core 0.4.x client the backend installs.
+To move it to the commit the ATP site expects after a `git pull`, run `git submodule update`
+again; to move it to another release, `git -C huri-modules checkout <tag>` and commit the new
+gitlink (then re-run the installer stages that changed, see [§7](#7-operating-it)).
 
 ### Where HuRI lives: two layouts
 
-- **A. Inside the submodule (recommended).** Install HuRI in `HuRI/`. The ATP scripts find it
-  automatically and use its venv's `serve`/`ray` binaries. The rest of this guide assumes this.
-- **B. An existing HuRI checkout elsewhere** (e.g. you already ran the installer in another
-  clone). Do not install twice; point the site at it instead:
+- **A. Inside the submodule (recommended).** Install HuRI in `huri-modules/`. The ATP backend
+  finds it automatically, runs `serve run` from it with its installer environment
+  (`.huri-local/env.sh`) and its venv's `serve`/`ray` binaries. The rest of this guide assumes
+  this.
+- **B. An existing huri-modules checkout elsewhere** (e.g. you already ran the installer in
+  another clone; a sibling `../huri-modules` is found automatically). Do not install twice;
+  point the site at it instead:
   ```bash
-  export HURI_REPO_PATH=/path/to/your/HuRI
+  export HURI_MODULES_PATH=/path/to/your/huri-modules
   ```
-  before `./scripts/run_all.sh`. The launcher will use `$HURI_REPO_PATH/.venv/bin/serve` and
-  list `$HURI_REPO_PATH/config/huri*.yaml`. Note that Qdrant and Ollama are machine-wide
-  services, not per-checkout: two checkouts on one machine share them.
+  before `./scripts/run_all.sh`. The launcher will run from that checkout, use
+  `$HURI_MODULES_PATH/.venv/bin/serve` and list `$HURI_MODULES_PATH/config/huri*.yaml`. Note
+  that Qdrant and Ollama are machine-wide services, not per-checkout: two checkouts on one
+  machine share them.
 
 ---
 
@@ -171,8 +183,8 @@ installer stages that changed, see [§7](#7-operating-it)).
 
 ### 4.1 How the installer works
 
-`HuRI/scripts/install_local.sh` is the bare-metal counterpart of the Docker images and Helm
-chart. It runs in stages:
+`huri-modules/install.sh` (a wrapper around its `scripts/install_local.sh`, every flag applies)
+is the bare-metal counterpart of the Docker images and Helm chart. It runs in stages:
 
 1. **Detect** — OS, package manager, CPU/RAM/disk, GPU vendor + VRAM (`nvidia-smi` /
    `rocm-smi`), Python, Docker/Podman, Ollama.
@@ -181,10 +193,11 @@ chart. It runs in stages:
    or `blocked`. Modules that do not fit are dropped from `HURI_MODULES`, so no Serve
    deployment is ever created for them.
 3. **system** — apt/dnf/pacman/zypper packages.
-4. **python** — a venv at `HuRI/.venv` with the right torch build (CUDA 12.1, ROCm, or CPU),
-   `requirements.txt`, the CosyVoice/EMAGE stack when needed, and a clone of the CosyVoice
-   source tree into `HuRI/assets/cosyvoice`.
-5. **models** — weights into `HuRI/assets/models/`: faster-whisper (Hugging Face), CosyVoice3
+4. **python** — a venv at `huri-modules/.venv` with the right torch build (CUDA 12.1, ROCm, or
+   CPU), huri-core and huri-cli at the refs pinned in `versions.env`, the curated module
+   packages, the CosyVoice/EMAGE stack when needed, and a clone of the CosyVoice source tree
+   into `huri-modules/assets/cosyvoice`.
+5. **models** — weights into `huri-modules/assets/models/`: faster-whisper (Hugging Face), CosyVoice3
    (ModelScope), EMAGE (Hugging Face), the emotion classifier (HF cache), and your voice sample.
 6. **services** — a local Qdrant (Docker container `huri-qdrant`, or a binary) and Ollama with
    the planned models — **only for endpoints that resolve to this machine**.
@@ -195,8 +208,9 @@ chart. It runs in stages:
 Useful switches: `--plan-only` (stop after 2), `-n/--dry-run` (print every command),
 `-y/--yes` (no prompts — this also auto-runs the official Ollama installer if Ollama is needed
 and missing), `--only system,python,models,services,config,verify` (re-run selected stages),
-`--skip-system|python|models|services`. Everything it writes lives in `HuRI/.huri-local/`,
-`HuRI/assets/` and `HuRI/config/*.generated.yaml`, so an install is inspectable and removable.
+`--skip-system|python|models|services`. Everything it writes lives in
+`huri-modules/.huri-local/`, `huri-modules/assets/` and `huri-modules/config/*.generated.yaml`,
+so an install is inspectable and removable.
 
 ### 4.2 Choose where the LLM, embeddings and Qdrant live
 
@@ -221,8 +235,8 @@ Two more flags shape the endpoints:
 ### 4.3 The reference full install, explained
 
 ```bash
-cd HuRI
-./scripts/install_local.sh \
+cd huri-modules
+./install.sh \
   --llm-url https://llm.huri.lan --llm-model Qwen3.5-4B-GGUF \
   --embed-url https://embedding.huri.lan --embed-model bge-large-en-v1.5-gguf-Q4_K_M \
   --no-verify-ssl \
@@ -238,7 +252,7 @@ cd HuRI
 | `--embed-model bge-large-en-v1.5-gguf-Q4_K_M` | The `model` field of embedding requests. llama.cpp ignores it (it serves one model); Ollama uses it to pick the model. Must be the **same model that was used to ingest the documents** in Qdrant (see [§5.1](#51-qdrant)). |
 | `--no-verify-ssl` | Private CA / self-signed certs on all three hosts. |
 | `--qdrant-url https://qdrant.pommier.lan` | Remote Qdrant over HTTPS. No port → 443 (HuRI derives the port from the scheme). |
-| `--voice-sample ../assets/voice.wav` | The zero-shot reference voice for TTS, copied to `HuRI/assets/voice.wav`. `assets/voice.wav` is the **default voice shipped in this repo** and it says the default transcript, so no `--voice-transcript` is needed. For another voice pass your own file **and** its transcript — see [§4.5](#45-the-voice-sample). |
+| `--voice-sample ../assets/voice.wav` | The zero-shot reference voice for TTS (CosyVoice), copied to `huri-modules/assets/voice.wav`. `assets/voice.wav` is the **default voice shipped in this repo** and it says the default transcript, so no `--voice-transcript` is needed. For another voice pass your own file **and** its transcript — see [§4.5](#45-the-voice-sample). |
 
 With every service remote, the plan on a 12 GiB RTX 3060 is: TTS on GPU (fp16), gesture on
 GPU, STT-base on GPU, emotion on CPU, LLM/embeddings/memory remote → verdict **full**, and no
@@ -249,8 +263,8 @@ Ollama or Qdrant is installed locally.
 #### A. Everything local with Ollama (simplest)
 
 ```bash
-cd HuRI
-./scripts/install_local.sh --yes --voice-sample ../assets/voice.wav
+cd huri-modules
+./install.sh --yes --voice-sample ../assets/voice.wav
 ```
 
 The installer starts a `huri-qdrant` Docker container (or a binary), installs Ollama, and pulls
@@ -262,15 +276,15 @@ being dropped, on cards under 16 GiB — check `--plan-only` first.
 #### B. A hosted API with a key (OpenAI, Mistral, Groq, OpenRouter, any OpenAI-compatible)
 
 ```bash
-cd HuRI
-./scripts/install_local.sh \
+cd huri-modules
+./install.sh \
   --llm-url https://api.openai.com --llm-provider api \
   --llm-model gpt-4o-mini --llm-api-key "$OPENAI_API_KEY" \
   --embed-url http://localhost:11434 --embed-model bge-m3 \
   --voice-sample ../assets/voice.wav
 ```
 
-- The key is written to `HuRI/.huri-local/secrets.env` (mode `0600`) and exported as
+- The key is written to `huri-modules/.huri-local/secrets.env` (mode `0600`) and exported as
   `HURI_LLM_API_KEY`; it is never written into the generated YAML. Only the `api` provider
   attaches it as `Authorization: Bearer …` — the installer warns if you pass a key with another
   provider.
@@ -280,14 +294,14 @@ cd HuRI
   embeddings only (the LLM is remote, so no LLM model is pulled). To use a hosted embedding
   model anyway, put a keyless LiteLLM proxy in front of it — see [§5.3](#53-the-embedding-model).
 - `--llm-model` is the provider's model id (use whatever your account offers).
-- Rotate the key later without reinstalling: `./scripts/install_local.sh --only config
+- Rotate the key later without reinstalling: `./install.sh --only config
   --llm-api-key "$NEW_KEY"`, then restart HuRI (a running Ray cluster keeps the old
   environment).
 
 #### C. Remote Ollama on another machine
 
 ```bash
-./scripts/install_local.sh --llm-url http://192.168.1.20:11434 --llm-model mistral:7b \
+./install.sh --llm-url http://192.168.1.20:11434 --llm-model mistral:7b \
   --embed-model bge-m3 --voice-sample ../assets/voice.wav
 ```
 
@@ -299,33 +313,35 @@ override), and run `ollama pull mistral:7b` and `ollama pull bge-m3` there.
 #### D. No GPU / CPU-only (text pipeline)
 
 ```bash
-./scripts/install_local.sh --profile cpu --stt-model base --llm-model qwen2.5:1.5b
+./install.sh --profile cpu --stt-model base --llm-model qwen2.5:1.5b
 ```
 
-STT runs int8 on CPU (realtime for `base`/`small`), the LLM is served from RAM by Ollama, and
-TTS/gesture are dropped. Presets that need `tts`/`gesture` will be greyed out in the site's
-Event Configuration modal, which is expected. Add `--force-tts` to try CPU synthesis anyway
-(several seconds per sentence).
+STT runs int8 on CPU (realtime for `base`/`small`), the LLM is served from RAM by Ollama, TTS
+runs on Piper (module `tts`, ONNX on CPU, faster than realtime) and gesture is dropped. Presets
+that need `mov` (gesture) will be greyed out in the site's Event Configuration modal, which is
+expected. `--force-gesture` runs EMAGE on CPU anyway (slowly).
 
 ### 4.5 The voice sample
 
-TTS (CosyVoice3) is zero-shot: it clones the voice of a reference recording, and needs that
+This applies to CosyVoice3 (`tts_cosyvoice`, NVIDIA only); Piper (`tts`) speaks with a stock
+voice (`--piper-voice`). CosyVoice3 is zero-shot: it clones the voice of a reference recording, and needs that
 recording plus the exact transcript of what it says.
 
 **Default voice — use it unless you want another one.** This repo ships `assets/voice.wav`
 (5 s, mono, 44.1 kHz), a recording of the default transcript *"Instinct creates its own
 oppressors and bids us rise up against them."* Pass it as `--voice-sample ../assets/voice.wav`
-(the path is relative to `HuRI/`, where the installer runs); the installer copies it to
-`HuRI/assets/voice.wav` and the default `--voice-transcript` already matches, so nothing else is
-needed. It lives in this repo rather than in HuRI because HuRI's own `assets/` folder is
-git-ignored (this repo's `.gitignore` has an explicit `!assets/voice.wav` exception). Once
-copied, the file stays in `HuRI/assets/`, so later `--only config` re-runs do not need the flag.
+(the path is relative to `huri-modules/`, where the installer runs); the installer copies it to
+`huri-modules/assets/voice.wav` and the default `--voice-transcript` already matches, so nothing
+else is needed. It lives in this repo rather than in huri-modules because huri-modules'
+`assets/` folder is git-ignored (this repo's `.gitignore` has an explicit `!assets/voice.wav`
+exception). Once copied, the file stays in `huri-modules/assets/`, so later `--only config`
+re-runs do not need the flag.
 
 **Custom voice.** Pass two flags that **must match each other**:
 
 - `--voice-sample PATH` — a WAV of one speaker, clean, no music or background noise, roughly
   5–15 seconds (CosyVoice resamples it, so 16 kHz or 44.1 kHz mono are both fine). Copied to
-  `HuRI/assets/voice.wav`, replacing whatever was there.
+  `huri-modules/assets/voice.wav`, replacing whatever was there.
 - `--voice-transcript "…"` — the **exact words spoken in that file**. Without the flag the
   default transcript above is used, which is only right for the default voice. A wrong
   transcript degrades or garbles synthesis.
@@ -335,29 +351,28 @@ The generated config stores it as
 `<|endofprompt|>` marker is a CosyVoice3 contract: the transcript must come *after* it or the
 model treats it as an instruction and sometimes speaks it aloud.
 
-To add or replace the sample after installing: `./scripts/install_local.sh --only models,config
+To add or replace the sample after installing: `./install.sh --only models,config
 --voice-sample new.wav --voice-transcript "…"` (`--only config` alone does not copy the file —
-`models` is the stage that does). Without any `HuRI/assets/voice.wav`, verification fails on
+`models` is the stage that does). Without any `huri-modules/assets/voice.wav`, verification fails on
 purpose: every TTS request would fail silently at runtime.
 
 ### 4.6 What the installer produced
 
-| Path (under `HuRI/`) | What |
+| Path (under `huri-modules/`) | What |
 |---|---|
 | `config/huri_local.generated.yaml` | The Ray Serve config for **this machine**: absolute model paths, `HURI_MODULES`, GPU fractions, and the `RAGHandle` `user_config` (Qdrant/LLM/embedding URLs, provider, model names, `verify_ssl`). **This is the config to launch from the ATP Control Panel.** |
-| `config/client_local.generated.yaml` | A matching config for the CLI client (`python -m src.client`). |
+| `config/client_local.generated.yaml` | A matching config for the reference CLI client (`huri-cli --config …`). |
 | `.huri-local/plan.env` | The hardware plan it acted on (profile, devices per module, endpoints). |
 | `.huri-local/huri.env` | The same runtime env vars as a sourceable `.env`. |
 | `.huri-local/secrets.env` | `HURI_LLM_API_KEY`, mode 0600. Present even when empty. |
-| `.huri-local/env.sh` | `source` it for a shell configured like a Serve replica: venv + `huri.env` + `secrets.env` + `PYTHONPATH`. Needed for ingestion and for `python -m src.launch_huri`. |
+| `.huri-local/env.sh` | `source` it for a shell configured like a Serve replica: venv + `huri.env` + `secrets.env`. Needed for ingestion and for `python -m huri_core.launch_huri`; the ATP launcher sources it before `serve run`. |
 | `.huri-local/start.sh` / `stop.sh` / `status.sh` | Run the stack outside the ATP site (see §4.7). |
 | `.huri-local/install.log` | Everything the installer ran. |
 | `.huri-local/qdrant/`, `.huri-local/bin/qdrant` | Local Qdrant data / binary, only for a local Qdrant. |
-| `.venv/` | HuRI's Python environment (`serve`, `ray` binaries live in `.venv/bin`). |
+| `.venv/` | HuRI's Python environment: huri-core, the modules, huri-cli (`serve`, `ray`, `huri-cli` binaries live in `.venv/bin`). |
 | `assets/voice.wav`, `assets/cosyvoice/`, `assets/models/…` | Voice sample (copied from this repo's default `assets/voice.wav`, or your `--voice-sample`), CosyVoice source, weights. |
 
-The installer also appends `/.huri-local/`, `/assets/` and `config/*.generated.yaml` to HuRI's
-`.gitignore`.
+These paths are git-ignored by huri-modules.
 
 ### 4.7 Start HuRI on its own and check it
 
@@ -365,7 +380,7 @@ You do not need this for the ATP site (the Control Panel launches HuRI), but it 
 way to validate the install:
 
 ```bash
-cd HuRI
+cd huri-modules
 .huri-local/start.sh          # local services (if any) + ray head + serve deploy
 .huri-local/status.sh         # qdrant / llm / ray / huri up-or-down + `serve status`
 curl -s http://localhost:8000/modules      # the modules this instance actually deployed
@@ -377,7 +392,7 @@ the terminal:
 
 ```bash
 source .huri-local/env.sh
-python -m src.client --config config/client_local.generated.yaml
+huri-cli --config config/client_local.generated.yaml
 ```
 
 Stop with `.huri-local/stop.sh` (Serve + Ray) or `.huri-local/stop.sh --all` (also the local
@@ -388,11 +403,16 @@ Qdrant container/binary and `ollama serve`).
 Re-run only the config stage; nothing is reinstalled:
 
 ```bash
-./scripts/install_local.sh --only config \
+./install.sh --only config \
   --llm-url https://other.lan --llm-model other-model --llm-provider vllm \
   --embed-url … --embed-model … --qdrant-url … --no-verify-ssl
-.huri-local/stop.sh && .huri-local/start.sh      # or Stop/Start in the Control Panel
+.huri-local/stop.sh && .huri-local/start.sh
 ```
+
+Stop/Start in the Control Panel also picks up the new endpoints (the RAG block of the regenerated
+config and `env.sh`), but it does **not** start a Qdrant or Ollama that the new flags made local
+— run `start.sh` once for that, or start them yourself (§6.5 lists what the panel does and does
+not start).
 
 Pass the complete set of endpoint flags each time: `--only config` regenerates the whole file
 from the flags given (the API key is the one exception — it is reloaded from `secrets.env` when
@@ -436,7 +456,7 @@ different model of the same dimension silently returns garbage.
 
 | Option | How |
 |---|---|
-| Local, managed by the installer | Leave `--qdrant-url` at its default. With Docker/Podman: container `huri-qdrant` from `qdrant/qdrant:v1.12.4`, ports 6333/6334, data in `HuRI/.huri-local/qdrant`. Without: the standalone binary in `.huri-local/bin`, started by `start.sh`. |
+| Local, managed by the installer | Leave `--qdrant-url` at its default. With Docker/Podman: container `huri-qdrant` from `qdrant/qdrant:v1.12.4`, ports 6333/6334, data in `huri-modules/.huri-local/qdrant`. Without: the standalone binary in `.huri-local/bin`, started by `start.sh`. |
 | Self-hosted on another machine | `docker run -d --name qdrant --restart unless-stopped -p 6333:6333 -p 6334:6334 -v /srv/qdrant:/qdrant/storage qdrant/qdrant:v1.12.4`, then `--qdrant-url http://that-host:6333`. For HTTPS put a reverse proxy in front (Caddy, Traefik, nginx) and pass `https://qdrant.example.lan` (no port → 443). |
 | Qdrant Cloud | Not supported out of the box: HuRI's client is built from a URL only and does not send an API key. Use it only behind a proxy that injects the key, or restrict access at the network level instead. |
 
@@ -491,14 +511,12 @@ The base URL is everything before `/v1/chat/completions`, e.g. `https://api.mist
 `https://api.groq.com/openai`, `https://openrouter.ai/api`. Where the key lives and how it
 reaches the replicas:
 
-- stored in `HuRI/.huri-local/secrets.env` (0600), exported as `HURI_LLM_API_KEY`;
+- stored in `huri-modules/.huri-local/secrets.env` (0600), exported as `HURI_LLM_API_KEY`;
 - `start.sh` sources it before `ray start`, so replicas inherit it;
-- **when HuRI is launched from the ATP Control Panel**, the `serve run` subprocess inherits the
-  *backend's* environment. Export the key in the shell that starts the site:
-  ```bash
-  source HuRI/.huri-local/secrets.env && ./scripts/run_all.sh
-  ```
-  or start HuRI with `start.sh` first and let the site attach to the running instance.
+- **when HuRI is launched from the ATP Control Panel**, the launcher sources
+  `huri-modules/.huri-local/env.sh` (which loads `secrets.env`) before `serve run`, so the key
+  reaches the replicas as with `start.sh` and nothing needs exporting. Without that file (a
+  manual install), export the key in the shell that starts the site instead.
   A Ray cluster that is already up keeps its old environment: stop it before changing the key.
 
 ### 5.3 The embedding model
@@ -532,9 +550,9 @@ An empty Qdrant makes RAG answer from the LLM alone (plus conversation memory). 
 knowledge, ingest documents with the same embedding endpoint HuRI uses:
 
 ```bash
-cd HuRI
+cd huri-modules
 source .huri-local/env.sh
-python -m src.modules.rag.ingestion \
+python -m huri_rag.ingestion \
   --qdrant-url https://qdrant.pommier.lan --no-verify-ssl \
   --embedding-url https://embedding.huri.lan --embedding-model bge-large-en-v1.5-gguf-Q4_K_M \
   --chunking fixed \
@@ -562,12 +580,23 @@ python -m src.modules.rag.ingestion \
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r backend/requirements.txt     # fastapi, uvicorn, websockets, numpy, scipy, authlib, itsdangerous, httpx…
+.venv/bin/pip install -r backend/requirements.txt     # fastapi, uvicorn, numpy, scipy, authlib, httpx…, huri-core[client], huri-events
 ```
 
-This venv is deliberately separate from `HuRI/.venv`: the backend imports HuRI's
-`src.interfaces.web_interface` (pure Python, no ML deps) from `HURI_REPO_PATH`, and delegates
-`serve`/`ray` to HuRI's own venv binaries.
+`requirements.txt` installs the HuRI client SDK and the curated events from git, at their
+releases (huri-core `0.4.0`, huri-events from huri-modules `0.1.0`); no Ray, no torch. To use
+local checkouts instead, install them editable (`.venv/bin/pip install -e '<huri-core>[client]'
+-e <huri-modules>/packages/huri-events`) and run the scripts with
+`SKIP_PIP_INSTALL=1 ./scripts/run_all.sh` (or `run_backend.sh`), which keeps the venv as is. This venv is deliberately separate from
+`huri-modules/.venv`: the backend only talks to HuRI over its websocket, and runs `serve`/`ray`
+through huri-modules' `.huri-local/env.sh`.
+
+To run the backend tests (a fake HuRI server stands in for the real one):
+
+```bash
+.venv/bin/pip install -r backend/requirements-dev.txt
+cd backend && ../.venv/bin/python -m pytest tests
+```
 
 ### 6.2 Frontend
 
@@ -584,15 +613,14 @@ file; export them in the shell, or `source` your own file first).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HURI_REPO_PATH` | `HuRI/` submodule if it contains `src/interfaces/web_interface.py`, else `../HuRI` | HuRI checkout: where `web_interface` is imported from and where `config/huri*.yaml` are listed. |
-| `HURI_SERVE_BIN` / `HURI_RAY_BIN` | `$HURI_REPO_PATH/.venv/bin/{serve,ray}` when that venv exists, else `serve`/`ray` from `PATH` | Binaries the Control Panel uses to launch/stop HuRI. |
-| `HURI_URL` | `ws://localhost:8000/session` | Where browser sessions connect; its HTTP form is also what the launcher probes for readiness (`/modules`). |
-| `HURI_PRESETS_DIR` | `<repo>/presets` | Client presets (`*.json`) and per-feature HuRI config copies (`F*/huri*.yaml`). |
+| `HURI_MODULES_PATH` | `huri-modules/` submodule if checked out, else `../huri-modules` | huri-modules checkout the Control Panel runs `serve run` from (sourcing its `.huri-local/env.sh`), and where `config/huri*.yaml` are listed. |
+| `HURI_URL` | `ws://localhost:8000/session` | Where browser sessions connect; its HTTP form serves `GET /modules`, which the launcher probes for readiness and `/huri-modules` proxies. |
+| `HURI_PRESETS_DIR` | `<repo>/presets` | Client presets (`*.json`). |
 | `HURI_DASHBOARD_URL` | `http://127.0.0.1:8265/` | Link shown in the Control Panel. |
 | `VITE_BACKEND_URL` | `http://localhost:8001` (set by the scripts) | Backend origin baked into the frontend. |
 | `REQUIRE_AUTH` | `0` in `run_all.sh`, `1` otherwise | See §6.7. |
 | `SESSION_SECRET`, `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `FRONTEND_URL`, `COOKIE_SECURE`, `COOKIE_SAMESITE`, `MAGIC_LINK_SECRET` | — | Auth only (§6.7). |
-| `HURI_LLM_API_KEY` | — | Not read by the site itself, but inherited by the `serve run` it spawns — required when HuRI uses `--llm-provider api` (§5.2). |
+| `HURI_LLM_API_KEY` | — | Not read by the site itself; `.huri-local/env.sh` provides it to the `serve run` the panel spawns (§5.2). |
 
 ### 6.4 Run it
 
@@ -603,38 +631,46 @@ file; export them in the shell, or `source` your own file first).
 ./scripts/run_frontend.sh
 ```
 
-`run_all.sh` prints the resolved `HURI_REPO_PATH`; if it warns that HuRI could not be found,
-the submodule is not checked out ([§3](#3-get-the-code)). HuRI itself is **not** started by
-these scripts.
+If the Control Panel says huri-modules could not be found, the submodule is not checked out
+([§3](#3-get-the-code)); if it says it is not installed, run `huri-modules/install.sh`
+([§4](#4-install-huri)). HuRI itself is **not** started by these scripts.
 
 ### 6.5 Launch HuRI from the Control Panel — which config to pick
 
 Open <http://localhost:5173>, click **HuRI Control Panel** (top bar; it opens automatically
-when nothing is running), choose a config, **Start**. The backend runs `serve run <config>`
-with the HuRI checkout as working directory, tails its logs into the panel, and reports
-*running* once `GET /modules` answers (up to 90 s). Only one instance can run at a time.
+when nothing is running), choose a config, **Start**. The backend runs
+`bash -c 'source .huri-local/env.sh && exec serve run <config>'` with the huri-modules checkout
+as working directory, in its own process group, tails its logs into the panel, and reports
+*running* once `GET /modules` answers (up to 90 s). When the process crashes or never gets
+ready, the output of `.huri-local/status.sh` (Qdrant, LLM, Ray, Serve app) is appended to the
+log tail as the hint for what is missing. Only one instance can run at a time.
 
-The dropdown lists every `config/huri*.yaml` in the HuRI checkout plus the copies under
-`presets/F*/`. **Not all of them are runnable on your machine**:
+The panel is **not** `.huri-local/start.sh`. That script ends in `serve deploy`, which detaches
+and returns, so the panel keeps a supervised `serve run` instead (its log tail and its Stop
+depend on it) and does only part of what `start.sh` does:
+
+| `start.sh` step | Control Panel |
+|---|---|
+| Source `env.sh` (venv, `huri.env`, `secrets.env`) | Yes. |
+| Start Qdrant (container or binary) and Ollama | **No: they are the operator's job.** Running `start.sh` once (then `stop.sh` without `--all`) leaves both up for the panel. Without Qdrant RAG returns nothing; `status.sh`'s report in the log tail says which one is down. |
+| GPU environment (`HIP_VISIBLE_DEVICES`, `HSA_OVERRIDE_GFX_VERSION`) | Yes: `env.sh` exports it (from huri-modules `0.1.0` on; see the note below). |
+| `ray start --head --num-cpus=… --num-gpus=…` | **No.** `serve run` autostarts a Ray head sized to the whole machine (every CPU and GPU), not to the installer's `HURI_RAY_GPUS`. To size it, start the head yourself (`source .huri-local/env.sh && ray start --head --num-gpus=N`) before **Start**: `serve run` joins it, and the panel's Stop then leaves it running. Stop runs `ray stop` only when no Ray head was up before Start. |
+
+The dropdown lists every `config/huri*.yaml` of the huri-modules checkout:
+
+> **With the huri-modules commit this repo currently pins**, `huri.yaml` and `huri_cpu.yaml`
+> do not run as described below yet: they still carry a developer's `PYTHONPATH`, Helm-only
+> `/models` paths and stale RAG keys, and `env.sh` does not export `HIP_VISIBLE_DEVICES` /
+> `HSA_OVERRIDE_GFX_VERSION`. Those runtime fixes come with huri-modules `0.1.0`; until the
+> submodule moves to it, use `huri_local.generated.yaml`.
 
 | Entry | Use it? |
 |---|---|
-| `huri_local.generated.yaml` | **Yes.** Generated by the installer for this machine: correct absolute model paths, only the modules that fit, and your LLM/embedding/Qdrant settings. |
-| `huri.yaml`, `huri_cpu.yaml` | Only after editing. They are hand-written templates with another machine's paths (`/home/fifster/…`, `/models/…`) and a RAG block in an older format (`llm_base_url`, no `llm_provider`) that the current `RAGHandle` ignores — it would then fall back to a local Ollama at `localhost:11434` with `mistral:7b`. |
-| `F1/huri.yaml`, `F2/huri.yaml`, … `F11/huri.yaml`, `F1/huri_cpu.yaml` | Byte-for-byte copies of the two above (see `presets/README.md`), so the same caveat applies. |
+| `huri_local.generated.yaml` | **Yes, on any machine.** Generated by the installer for this machine: only the modules that fit, and your LLM/embedding/Qdrant settings. |
+| `huri.yaml` | The reference GPU config (CosyVoice `tts_cosyvoice`, gesture on an NVIDIA GPU), the one the ATP features use (see `presets/README.md`). Its model paths are relative to the huri-modules checkout (the installer's layout), and its RAG block uses huri-modules' defaults, not your installer endpoints. |
+| `huri_cpu.yaml` | The reference CPU config (Piper `tts`), for F1's GPU-vs-CPU comparison. Same caveats. |
 
-To make the per-feature entries launchable as the ATP sheet describes, copy the generated
-config over them (they are documented as convenience copies, not the source of truth):
-
-```bash
-for d in presets/F*; do cp HuRI/config/huri_local.generated.yaml "$d/huri.yaml"; done
-```
-
-For `F1/huri_cpu.yaml` (the GPU-vs-CPU comparison), generate a CPU variant into a second HuRI
-checkout, or edit the copy's paths to match `huri_local.generated.yaml` and set `num_gpus: 0`
-everywhere.
-
-Alternatively start HuRI in a terminal with `HuRI/.huri-local/start.sh`: the panel detects an
+Alternatively start HuRI in a terminal with `huri-modules/.huri-local/start.sh`: the panel detects an
 instance it did not start (shown as *external*), the client connects to it as usual, and only
 **Stop** is disabled (stop it where you started it).
 
@@ -650,7 +686,7 @@ curl -s http://localhost:8000/modules                        # same, straight fr
 Then in the UI: the composer switches from *Connecting to HuRI…* to ready; open **Event
 Configuration** (gear), pick `F9/rag_only`, type a question, get a streamed answer. Pick a
 `voice_with_speech`-style preset to test mic → TTS → gesture (the avatar only renders when the
-session includes `gesture`). Presets needing modules this machine did not deploy are greyed
+session includes `mov`). Presets needing modules this machine did not deploy are greyed
 out — that is the plan from [§4.1](#41-how-the-installer-works), not a bug.
 
 ### 6.7 Authentication
@@ -670,28 +706,31 @@ one RAG partition). For per-user memory or a public deployment:
 
 ## 7. Operating it
 
-**Start order.** Remote services first (they must answer before `RAGHandle` initialises), then
-`./scripts/run_all.sh`, then **Start** in the Control Panel (or `HuRI/.huri-local/start.sh`).
-`HuRI/.huri-local/status.sh` shows every dependency in one screen.
+**Start order.** Qdrant and the LLM/embedding services first (they must answer before
+`RAGHandle` initialises; the Control Panel does not start them, see §6.5), then `./scripts/run_all.sh`, then **Start** in the Control
+Panel (or `huri-modules/.huri-local/start.sh`, which also starts local Qdrant and Ollama).
+`huri-modules/.huri-local/status.sh` shows every dependency in one screen.
 
-**Stop.** Ctrl-C in `run_all.sh` asks the launcher to stop HuRI (SIGINT to `serve run`, then
-`ray stop`) before exiting. A stack started with `start.sh` is stopped with `stop.sh`
-(`--all` also stops the local Qdrant container and `ollama serve`). The panel's Stop ends with
-`ray stop`, so any Ray head on the machine goes down with it.
+**Stop.** The panel's Stop, and the backend's own shutdown (Ctrl-C in `run_all.sh`), send
+SIGINT to the `serve run` process group (SIGKILL to whatever is left of it after 20 s), then
+`ray stop` only if that run started the Ray head; a Start clicked meanwhile waits for all of it.
+After a crash the panel does the same cleanup on its own. A stack started with `start.sh` is stopped with `stop.sh` (`--all` also
+stops the local Qdrant container and `ollama serve`).
 
 **Update.**
 
 ```bash
 git pull
-git submodule update            # HuRI to the commit this repo pins
-cd HuRI
-./scripts/install_local.sh --only python,config      # new pins / new config keys
+git submodule update            # huri-modules to the commit this repo pins
+.venv/bin/pip install -r backend/requirements.txt    # the client SDK at the pinned release
+cd huri-modules
+./install.sh --only python,config      # new pins / new config keys
 # add "models" if the pinned model ids changed, "services" if the Qdrant/Ollama versions did
 ```
 
 The installer is idempotent: existing venv, weights and containers are reused.
 
-**Remove.** Inside `HuRI/`: `.huri-local/stop.sh --all`, then `rm -rf .huri-local .venv assets
+**Remove.** Inside `huri-modules/`: `.huri-local/stop.sh --all`, then `rm -rf .huri-local .venv assets
 config/*.generated.yaml`; `docker rm -f huri-qdrant` for the local container (its data was in
 `.huri-local/qdrant`); `ollama rm <model>` for pulled models. In this repo: `rm -rf .venv
 frontend/node_modules`.
@@ -702,8 +741,8 @@ frontend/node_modules`.
 
 | Symptom | Cause / fix |
 |---|---|
-| Panel: `Could not exec 'serve'` | HuRI's venv is missing where the site looks (`HURI_REPO_PATH`). Install HuRI in the submodule, or export `HURI_REPO_PATH` / `HURI_SERVE_BIN`. |
-| Panel: `A HuRI instance is already answering … started outside this backend` | Something already serves `:8000` (a `start.sh` stack, a previous crash). Use it as is, or `HuRI/.huri-local/stop.sh`. |
+| Panel: `huri-modules … is not installed`, or logs end with `serve: command not found` | huri-modules is not installed where the site looks (`HURI_MODULES_PATH`). Run `huri-modules/install.sh`, or export `HURI_MODULES_PATH`. |
+| Panel: `A HuRI instance is already answering … started outside this backend` | Something already serves `:8000` (a `start.sh` stack, a previous crash). Use it as is, or `huri-modules/.huri-local/stop.sh`. |
 | Panel stuck on *starting*, logs show `Path '/' not found … route table is not populated yet` | Normal while models load; TTS warm-up on first start can take minutes. Watch the Ray dashboard. |
 | Composer stays at *Connecting to HuRI…* | HuRI is not answering `GET /modules` at `HURI_URL`'s host. Check `curl localhost:8000/modules` and the panel logs. |
 | `RAG FAILED during embedding … HTTP 401/403` | The embedding endpoint needs a key HuRI never sends. Serve embeddings from Ollama/llama.cpp/TEI, or a keyless LiteLLM proxy (§5.3). |
@@ -713,21 +752,22 @@ frontend/node_modules`.
 | Answers ignore the ingested documents | Ingested under a different `--user-id` than the session's (`anonymous` when auth is off). Re-ingest with `--user-id __shared__`. |
 | `Unknown llm_provider` / LLM answers 404 | `--llm-provider` does not match the server: Ollama native is `ollama`, everything OpenAI-shaped is `vllm` (no key) or `api` (key). |
 | LLM answers 401 with `--llm-provider vllm` | The endpoint wants a key: `--llm-provider api --llm-api-key …`. |
-| LLM 401 only when launched from the panel | `HURI_LLM_API_KEY` is not in the backend's environment. `source HuRI/.huri-local/secrets.env` before `run_all.sh`, and make sure no stale Ray head is running. |
+| LLM 401 only when launched from the panel | A stale Ray head kept its old environment (the key changed after it started): stop it and Start again. |
 | Installer: `--llm-url points at … — pass --llm-model` | A remote LLM has no auto-picked tier; name the model the server serves. |
 | Installer: `no suitable Python found (need 3.10–3.12)` | Install 3.12 (deadsnakes / pyenv / uv) and pass `--python /path/to/python3.12`. |
 | Installer: `torch cannot see the GPU` | Driver too old for CUDA 12.1, or on WSL2 the Windows NVIDIA driver is missing. `nvidia-smi` must work in the same shell. |
 | Installer: `no assets/voice.wav — TTS is enabled but has no reference voice` | The installer ran without `--voice-sample`. Default voice: `--only models,config --voice-sample ../assets/voice.wav`; own voice: add `--voice-transcript "…"` (§4.5). |
 | TTS speaks a strange sentence before the answer | The transcript ended up before `<|endofprompt|>`; regenerate the config (`--only config`) rather than hand-editing `HURI_VOICE_TRANSCRIPT`. |
 | `RuntimeError: HURI_VOICE_TRANSCRIPT is not set` | Launched a hand-written config without that env var; use `huri_local.generated.yaml`. |
-| `ModuleNotFoundError: No module named 'pkg_resources'` at STT start | setuptools ≥ 82 removed it; HuRI pins `setuptools<82` in `constraints.txt`. `--only python` after updating the submodule. |
+| Event Configuration: `HuRI refused the session: … (server modules: …)` | The session asks for a module this server did not enable (`HURI_MODULES` of the launched config); the message lists the ones it has. |
+| `ModuleNotFoundError: No module named 'pkg_resources'` at STT start | setuptools ≥ 82 removed it; huri-modules pins `setuptools<82` in `constraints.txt`. `--only python` after updating the submodule. |
 | Replica crash: `'FieldDescriptor' object has no attribute 'label'` | protobuf ≥ 5 got installed over the pin; `--only python` reinstalls with `constraints.txt` (`protobuf==4.25.8`). |
 | `TypeError: cannot pickle '_thread.lock'` on deploy | FastAPI ≥ 0.139.2 with this Ray version; constraints pin `fastapi<0.139.2`, re-run `--only python`. |
 | Ollama: `not answering on :11434` | `ollama serve` is not running (or `OLLAMA_HOST` was changed). Start it; `start.sh` does so automatically for a local install. |
 | Avatar never renders; `backend/static/model.fbx` is a ~130-byte text file starting with `version https://git-lfs` | Cloned without Git LFS. `git lfs install && git lfs pull`, then restart the frontend. |
-| Presets greyed out in Event Configuration | The module is not in `HURI_MODULES` for this machine (see `HuRI/.huri-local/plan.env`). Expected on CPU-only / small-VRAM installs; `--force-tts`/`--force-gesture` to override. |
+| Presets greyed out in Event Configuration | The module is not in `HURI_MODULES` for this machine (see `huri-modules/.huri-local/plan.env`). Expected on CPU-only / small-VRAM installs; `--force-tts`/`--force-gesture` to override. |
 | Second `Start` collides on ports | Only one HuRI per machine: Ray Serve binds 8000/8265. Stop the first one. |
 
 Logs to look at, in order: the Control Panel log tail, the Ray dashboard
-(<http://127.0.0.1:8265>, per-deployment logs), `HuRI/.huri-local/install.log`, and
-`HuRI/.huri-local/{qdrant,ollama}.log` for local services.
+(<http://127.0.0.1:8265>, per-deployment logs), `huri-modules/.huri-local/install.log`, and
+`huri-modules/.huri-local/{qdrant,ollama}.log` for local services.

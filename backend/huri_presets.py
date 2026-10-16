@@ -1,23 +1,16 @@
 """Named module-combination presets for the Event Configuration modal.
 
-Each preset is a ``{tag: {"name": <module>, "args": {...}}}`` block — exactly
-the ``modules`` shape ``src.interfaces.web_interface.run_browser_session``
-expects in its handshake (see HuRI/src/interfaces/web_interface.py). The
-frontend lets a tester pick one of these as a starting point (or build a
-custom combination) when configuring a session, covering HuRI/ATP.xlsx F1/F2
-(different module combinations) without needing a server restart.
+Each preset is a ``{tag: {"name": <module>, "args": {...}}}`` block: the
+``modules`` block of a HuRI session handshake (the ``modules:`` section of a
+huri-cli client config), with huri-modules' module names. See
+``presets/README.md`` for the layout and huri-modules'
+``config/client_template.yaml`` for the shape.
 
-Presets themselves live as ``<name>.json`` files under the repo-root
-``presets/`` folder (see that folder's README), one preset per file, keyed by
-their path relative to that folder (subfolders included — see below).
-``load_presets()`` re-scans the folder tree on every call, so dropping a new
-file in anywhere under it — or editing/removing one — takes effect on the
-next ``GET /presets`` request with no server restart, and no re-import of
-this module. Override the folder with the ``HURI_PRESETS_DIR`` env var (e.g.
-to point at a mounted volume in a container where the repo root isn't
-present — see backend/Dockerfile's build-context note).
-
-Mirrors HuRI/config/client_full.yaml and HuRI/config/client_text.yaml.
+Presets live as ``<name>.json`` files under the repo-root ``presets/`` folder,
+keyed by their path relative to it. ``load_presets()`` re-scans the tree on
+every call, so a file added, edited or removed shows up on the next
+``GET /presets`` with no restart. ``HURI_PRESETS_DIR`` overrides the folder
+(e.g. a mounted volume in a container, see backend/Dockerfile).
 """
 
 import json
@@ -30,24 +23,17 @@ logger = logging.getLogger(__name__)
 
 Preset = Dict[str, Dict[str, Any]]
 
-# Repo root is this file's grandparent (backend/huri_presets.py -> backend/ -> repo root).
 _DEFAULT_PRESETS_DIR = Path(__file__).resolve().parents[1] / "presets"
 PRESETS_DIR = Path(os.environ.get("HURI_PRESETS_DIR", str(_DEFAULT_PRESETS_DIR)))
 
 
 def load_presets(presets_dir: Path = PRESETS_DIR) -> Dict[str, Preset]:
-    """Recursively scan ``presets_dir`` for ``*.json`` files (any depth of
-    subfolders) and return ``{relative_path_without_suffix: preset}``, sorted
-    by that key — e.g. ``presets/F5/voice_with_speech.json`` becomes
-    ``F5/voice_with_speech``. Subfolders are just an organizational convenience
-    for whoever maintains the presets; nesting carries no meaning to the
-    backend or frontend beyond the resulting key.
+    """Every ``*.json`` under ``presets_dir`` (any depth) as
+    ``{relative_path_without_suffix: preset}``, sorted by key:
+    ``presets/F4/voice_with_speech.json`` is ``F4/voice_with_speech``.
 
-    Called fresh on every ``/presets`` request (see main.py) rather than
-    cached at import time, so new/edited/removed preset files anywhere under
-    the tree are picked up immediately. A preset file that fails to parse
-    (bad JSON, or JSON that isn't an object) is skipped with a logged warning
-    instead of failing the whole endpoint.
+    A file that is not valid JSON, or not a JSON object, is skipped with a
+    logged warning instead of failing the whole endpoint.
     """
     presets: Dict[str, Preset] = {}
 
@@ -75,7 +61,6 @@ def load_presets(presets_dir: Path = PRESETS_DIR) -> Dict[str, Preset]:
             )
             continue
 
-        key = path.relative_to(presets_dir).with_suffix("").as_posix()
-        presets[key] = preset
+        presets[path.relative_to(presets_dir).with_suffix("").as_posix()] = preset
 
     return presets

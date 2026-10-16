@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { BACKEND_URL } from "../config.js";
-import { useAvailableModules, presetIsAvailable } from "../hooks/useAvailableModules.js";
+import { useAvailableModules } from "../hooks/useAvailableModules.js";
+import { presetIsAvailable } from "../modules.js";
 import { useHuriStatus } from "../hooks/useHuriStatus.js";
 
 const POLL_MS = 2000;
@@ -26,14 +27,15 @@ function clientUrlForPreset(presetName) {
 }
 
 /**
- * Admin control panel: launch/stop a local HuRI (Ray Serve) instance from a
- * config in the HuRI submodule, watch its logs, then jump to the Ray
+ * Admin control panel: launch/stop a local HuRI (Ray Serve) instance from one
+ * of huri-modules' configs, watch its logs, then jump to the Ray
  * dashboard or open client tab(s) against it — covers HuRI/ATP.xlsx F1
  * end-to-end and gives F2-F11 a one-click way to get both HuRI and a client
  * up. See backend/huri_launcher.py for the process supervision this drives.
  */
 export default function LauncherPanel({ onClose }) {
   const [configs, setConfigs] = useState([]);
+  const [installProblem, setInstallProblem] = useState(null);
   const [selectedConfig, setSelectedConfig] = useState("");
   const [presets, setPresets] = useState({});
   const [selectedPreset, setSelectedPreset] = useState("custom");
@@ -48,6 +50,7 @@ export default function LauncherPanel({ onClose }) {
       .then((r) => r.json())
       .then((data) => {
         setConfigs(data.configs || []);
+        setInstallProblem(data.install_problem || null);
         setSelectedConfig((prev) => prev || data.configs?.[0] || "");
       })
       .catch(() => setConfigs([]));
@@ -146,10 +149,7 @@ export default function LauncherPanel({ onClose }) {
             {configs.length === 0 && <option value="">No configs found</option>}
             {configs.map((c) => (
               <option key={c} value={c}>
-                {/* Bare filename -> lives at HuRI/config/<c>; anything with a
-                    "/" is a per-ATP-feature copy under presets/<c> instead
-                    (see presets/README.md and huri_launcher.py). */}
-                {c.includes("/") ? `presets/${c}` : `HuRI/config/${c}`}
+                huri-modules/config/{c}
               </option>
             ))}
           </select>
@@ -176,6 +176,11 @@ export default function LauncherPanel({ onClose }) {
           )}
         </div>
 
+        {installProblem && (
+          <div className="modal-hint" style={{ color: "var(--danger)" }}>
+            {installProblem}
+          </div>
+        )}
         {status && (
           <div className="launcher-status-row">
             <span className={`status-pill launcher-status-${status.status}`}>

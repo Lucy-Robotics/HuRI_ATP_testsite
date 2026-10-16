@@ -1,3 +1,3 @@
-[submodule "HuRI"]
-	path = HuRI
-	url = https://github.com/Sentience-Robotics/HuRI.git
+[submodule "huri-modules"]
+	path = huri-modules
+	url = https://github.com/Lucy-Robotics/huri-modules.git

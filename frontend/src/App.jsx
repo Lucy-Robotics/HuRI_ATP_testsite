@@ -8,10 +8,11 @@ import { useWebSocket } from "./hooks/useWebSocket.js";
 import { useHuriStatus } from "./hooks/useHuriStatus.js";
 import useStore from "./store/index.js";
 import { BACKEND_URL } from "./config.js";
+import { withServedTTS } from "./modules.js";
 
-// A minimal, guaranteed-valid first handshake (mirrors backend/huri_presets.py's
-// TEXT_ONLY) so the app connects immediately; the Event Configuration modal
-// offers the full named presets (fetched from /presets) to switch afterwards.
+// A minimal first handshake (presets/F9/rag_only.json) so the app connects
+// immediately; the Event Configuration modal offers the named presets
+// (fetched from /presets) to switch afterwards.
 const DEFAULT_MODULES = {
   rag: { name: "rag", args: { language: "en", tone: "formal", response_format: "short" } },
 };
@@ -98,7 +99,7 @@ function TestingApp({ user }) {
   const statusMessage = useStore((s) => s.statusMessage);
   const hasModule = useStore((s) => s.hasModule);
   const reconfigure = useStore((s) => s.reconfigure);
-  const showAvatar = hasModule("gesture");
+  const showAvatar = hasModule("mov");
 
   // A tab opened from the Control Panel's "Open client tab" (LauncherPanel.jsx)
   // carries `?preset=<name>` — apply it once `reconfigure` is wired up (after
@@ -110,10 +111,12 @@ function TestingApp({ user }) {
     const presetName = new URLSearchParams(window.location.search).get("preset");
     if (!presetName) return;
     appliedPresetFromUrl.current = true;
-    fetch(`${BACKEND_URL}/presets`, { credentials: "include" })
-      .then((r) => r.json())
-      .then((presets) => {
-        if (presets[presetName]) reconfigure(presets[presetName]);
+    const getJson = (path) =>
+      fetch(`${BACKEND_URL}${path}`, { credentials: "include" }).then((r) => r.json());
+    Promise.all([getJson("/presets"), getJson("/huri-modules").catch(() => ({}))])
+      .then(([presets, served]) => {
+        const preset = presets[presetName];
+        if (preset) reconfigure(withServedTTS(preset, served.modules ?? null));
       })
       .catch(() => {});
   }, [reconfigure]);
