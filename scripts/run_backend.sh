@@ -15,7 +15,7 @@ if [ ! -d "$VENV" ]; then
 fi
 source "$VENV/bin/activate"
 # SKIP_PIP_INSTALL=1 keeps the venv as is, e.g. with huri-core / huri-events
-# installed editable from local checkouts before their pinned tags exist.
+# installed editable from local checkouts.
 if [ "${SKIP_PIP_INSTALL:-0}" != 1 ]; then
   pip install -q -r requirements.txt
 fi

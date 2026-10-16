@@ -172,15 +172,9 @@ rather than fall back to a public default, since it's what makes the session coo
   repo-root `presets/` folder in its build context (see the `TODO(deploy)` comment at its top).
   Local dev via the scripts above is unaffected.
 - `backend/requirements.txt` pins huri-core (`huri-core[client]`, tag `0.4.0`) and huri-events
-  (huri-modules tag `0.1.0`). Those tags come with the huri-core 0.4.0 / huri-modules 0.1.0
-  release, now in progress: until they are pushed, `pip install -r backend/requirements.txt`
-  fails to resolve them; install both editable from local checkouts instead
-  (`.venv/bin/pip install -e '<huri-core>[client]' -e <huri-modules>/packages/huri-events`,
-  then the rest of the file), and start the scripts with `SKIP_PIP_INSTALL=1`
-  (`SKIP_PIP_INSTALL=1 ./scripts/run_all.sh` or `./scripts/run_backend.sh`): otherwise their
-  `pip install -r requirements.txt` fails on the missing tags and stops them. The `huri-modules` submodule likewise pins a `dev` commit until
-  the `0.1.0` tag exists, and must then be moved to it (`git -C huri-modules checkout 0.1.0`,
-  commit the gitlink).
+  (huri-modules tag `0.1.0`), and the `huri-modules` submodule is at the `0.1.0` tag. To try
+  local checkouts of either instead, install them editable in `.venv` and start the scripts with
+  `SKIP_PIP_INSTALL=1`, so that they keep the venv as is.
 - The Control Panel runs `serve run` with huri-modules' `.huri-local/env.sh`, not the full
   `.huri-local/start.sh`: it does not start Qdrant/Ollama (run `start.sh` once, then `stop.sh`
   without `--all`, to leave them up), and the Ray head `serve run` autostarts is sized to the

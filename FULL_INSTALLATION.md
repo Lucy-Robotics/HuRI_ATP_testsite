@@ -584,12 +584,10 @@ python3 -m venv .venv
 ```
 
 `requirements.txt` installs the HuRI client SDK and the curated events from git, at their
-releases (huri-core `0.4.0`, huri-events from huri-modules `0.1.0`); no Ray, no torch. Those
-tags come with the release now in progress: until they exist, install both editable from local
-checkouts first (`.venv/bin/pip install -e '<huri-core>[client]' -e
-<huri-modules>/packages/huri-events`, then the rest of the file), and run the scripts with
-`SKIP_PIP_INSTALL=1 ./scripts/run_all.sh` (or `run_backend.sh`): without it their
-`pip install -r requirements.txt` fails on the missing tags and stops them. This venv is deliberately separate from
+releases (huri-core `0.4.0`, huri-events from huri-modules `0.1.0`); no Ray, no torch. To use
+local checkouts instead, install them editable (`.venv/bin/pip install -e '<huri-core>[client]'
+-e <huri-modules>/packages/huri-events`) and run the scripts with
+`SKIP_PIP_INSTALL=1 ./scripts/run_all.sh` (or `run_backend.sh`), which keeps the venv as is. This venv is deliberately separate from
 `huri-modules/.venv`: the backend only talks to HuRI over its websocket, and runs `serve`/`ray`
 through huri-modules' `.huri-local/env.sh`.
 
